@@ -1,12 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-"""MXCore HWPE: register input, shared TCDM, stream buffers and compute.
-
-The input port accepts peripheral IO requests at relative byte offsets 0x00-0x50.
-Completion is a pulse on done_irq and event_<initiator>_0 after all stores finish.
-The IO initiator is the zero-based core index; an unspecified initiator selects
-core zero when num_cores=1. TCDM bandwidth is bytes per cycle;
-the connected memory model supplies contention, latency and duration.
-"""
 import gvsoc.systree
 
 
@@ -20,7 +11,8 @@ class MXCore(gvsoc.systree.Component):
     name: str
         Instance name within the parent.
     vector_size: int
-        Number of FP8 products per dot product (VS).
+        Hardware byte lanes (VS): VS FP8 pairs or 2*VS packed FP4 pairs.
+        The current gwaihir FP4 path requires VS=32.
     npe: int
         Number of dot products issued in parallel.
     reuse: int
@@ -45,7 +37,8 @@ class MXCore(gvsoc.systree.Component):
         self.add_sources([
             'pulp/mxcore/mxcore.cpp',
             'pulp/mxcore/mxdotp.cpp',
-            'pulp/mxcore/fp8.cpp'
+            'pulp/mxcore/input_fmt.cpp',
+            'pulp/mxcore/quantizer.cpp'
         ])
         self.add_c_flags(['-std=c++17'])
 
@@ -86,7 +79,7 @@ class MXCore(gvsoc.systree.Component):
         self.itf_bind('done_irq', itf, signature='wire<bool>')
 
     def o_EVENT(self, itf: gvsoc.systree.SlaveItf, core: int=0, event: int=0):
-        """Bind an RTL per-core event (event 0 is completion; event 1 is idle)."""
+        """Bind an RTL event: 0 is compute completion; 1 is output completion."""
         if not 0 <= core < self.get_property('num_cores') or not 0 <= event < 2:
             raise ValueError('invalid MXCore core/event index')
         self.itf_bind('event_{}_{}'.format(core, event), itf, signature='wire<bool>')

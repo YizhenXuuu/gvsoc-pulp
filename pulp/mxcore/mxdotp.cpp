@@ -2,6 +2,7 @@
 #include "mxdotp.hpp"
 
 #include <stdexcept>
+#include <utility>
 
 namespace mxcore {
 
@@ -30,31 +31,45 @@ MXDotp::Parameters MXDotp::make_parameters(std::size_t vector_size) {
 MXDotp::MXDotp(std::size_t vector_size) : parameters_(make_parameters(vector_size)) {
 }
 
-MXDotp::Result MXDotp::compute(const Inputs &input, Fp8Format format) const {
+MXDotp::Result MXDotp::compute(const Inputs &input, InputFormat format) const {
+    get_input_encoding(format);
+    const bool packed_fp4 = format == InputFormat::E2M1;
+    if (packed_fp4 && parameters_.vector_size != 32) {
+        throw std::invalid_argument("FP4 requires VS=32 packed bytes (64 E2M1 elements)");
+    }
     if (input.a.size() != parameters_.vector_size || input.b.size() != parameters_.vector_size) {
         throw std::invalid_argument("MXDotp input lengths must match the configured vector_size");
     }
-    std::vector<Fp8Info> decoded_a(parameters_.vector_size);
-    std::vector<Fp8Info> decoded_b(parameters_.vector_size);
+    const std::size_t elements = parameters_.vector_size * (packed_fp4 ? 2 : 1);
+    std::vector<InputInfo> decoded_a(elements);
+    std::vector<InputInfo> decoded_b(elements);
 
-    for (std::size_t i = 0; i < parameters_.vector_size; ++i) {
-        decoded_a[i] = classify_fp8(input.a[i], format);
-        decoded_b[i] = classify_fp8(input.b[i], format);
+    for (std::size_t i = 0; i < elements; ++i) {
+        const std::size_t byte = packed_fp4 ? i / 2 : i;
+        const unsigned shift = packed_fp4 ? 4 * (i % 2) : 0;
+        decoded_a[i] = classify_input(input.a[byte] >> shift, format);
+        decoded_b[i] = classify_input(input.b[byte] >> shift, format);
     }
 
-    Result result(parameters_.vector_size);
+    Result result(elements);
     result.d_bits = input.d_bits;
     const Fp32Info info_d = decode_fp32(input.d_bits);
     // RTL evaluates special cases in parallel; the functional model resolves them first.
     result.special_raw = special_cases(decoded_a.data(), decoded_b.data(), decoded_a.size(), info_d);
+    // gwaihir's fpnew_mxdotp_multi_opt classifies E8M0 0xff as NaN.
+    // A NaN scale overrides an infinity result as well as a finite result.
+    if (input.scale_a == 0xff || input.scale_b == 0xff) {
+        result.special_raw = 0x8u | (result.special_raw & 0x4u);
+    }
     if ((result.special_raw & 0x8u) != 0) {
         return result;
     }
 
-    // 1. i_vector_multiplier_fp8 + i_product_exponent_fp8 + i_product_align_fp8
-    for (std::size_t i = 0; i < parameters_.vector_size; ++i) {
-        const Fp8Info &a = decoded_a[i];
-        const Fp8Info &b = decoded_b[i];
+    // 1. Shared product path. FP4 significands are extended losslessly to the
+    // common three fraction bits, so both nibble sets use the same 2^-34 anchor.
+    for (std::size_t i = 0; i < elements; ++i) {
+        const InputInfo &a = decoded_a[i];
+        const InputInfo &b = decoded_b[i];
         LaneTrace     &lane = result.lanes[i];
         lane.significand_a = a.significand;
         lane.significand_b = b.significand;
@@ -69,16 +84,21 @@ MXDotp::Result MXDotp::compute(const Inputs &input, Fp8Format format) const {
         }
         const int product_unsigned_ab = int(lane.significand_a * lane.significand_b);
         lane.product_signed = a.sign != b.sign ? -product_unsigned_ab : product_unsigned_ab;
-        // FP8 aligned products fit in 67 signed bits. Keep the sign through multiplication.
+        // Aligned input products fit in 67 signed bits. Keep the sign through multiplication.
         lane.shifted_product = lane.shift_amount >= DotpProductShiftWidth
                                    ? 0
                                    : DotpWide(lane.product_signed) * (DotpWide(1) << lane.shift_amount);
         result.sum_product += lane.shifted_product;
     }
 
+    return this->accumulate(std::move(result), input);
+}
+
+MXDotp::Result MXDotp::accumulate(Result result, const Inputs &input) const {
+    const Fp32Info info_d = decode_fp32(input.d_bits);
     // 2. i_scale_adder
-    // Match current RTL signed 8-bit scale arithmetic, including 0xff. The RTL
-    // classifier's signed comparison does not flag 0xff as NaN (covered by tests).
+    // Match RTL signed 8-bit scale arithmetic. The 0xff NaN code was
+    // handled before this finite datapath.
     // exponent_major = (rscale_a-127) + (rscale_b-127) + parameters_.exponent_major_offset
     result.scale_exp_a = int8_t(int(input.scale_a) - DotpScaleBias);
     result.scale_exp_b = int8_t(int(input.scale_b) - DotpScaleBias);

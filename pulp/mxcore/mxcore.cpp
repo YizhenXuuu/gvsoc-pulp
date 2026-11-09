@@ -2,6 +2,7 @@
 // MXCore HWPE. Register input, clocked FSM and completion follow LightRedmule's
 // component structure; register semantics and the data path follow MXCore RTL.
 #include "mxdotp.hpp"
+#include "quantizer.hpp"
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -25,7 +26,8 @@ typedef uint8_t fp8e5m2;
 using Bytes = std::vector<uint8_t>;
 using FifoLanes = std::vector<std::deque<Bytes>>;
 using mxcore::FpStatus;
-using mxcore::Fp8Format;
+using mxcore::InputFormat;
+using mxcore::OutputFormat;
 using mxcore::MXDotp;
 
 enum mxcore_state : uint8_t {
@@ -56,7 +58,7 @@ static constexpr unsigned NB_INPUT_STREAMS = 4;
 static constexpr unsigned NB_OUTPUT_STREAMS = 2;
 static constexpr unsigned NB_TCDM_CHANNELS = 5;
 static constexpr unsigned STREAM_FIFO_DEPTH = 2;
-static constexpr unsigned NB_IO_REGS = 13;
+static constexpr unsigned NB_IO_REGS = 16;
 static constexpr unsigned MAX_CORES = 16;
 static constexpr unsigned NB_EVENTS = 2;
 
@@ -71,6 +73,10 @@ uint8_t matmul_fp8e4m3(uint32_t *z, const uint32_t *d, const fp8e4m3 *a, const f
 uint8_t matmul_fp8e5m2(uint32_t *z, const uint32_t *d, const fp8e5m2 *a, const fp8e5m2 *b,
                        const uint8_t *scale_a, const uint8_t *scale_b, unsigned m_size, unsigned k_size,
                        unsigned vs, unsigned npe, unsigned reuse, const MXDotp &dotp);
+
+uint8_t matmul_fp4(uint32_t *z, const uint32_t *d, const uint8_t *a, const uint8_t *b,
+                   const uint8_t *scale_a, const uint8_t *scale_b,
+                   unsigned vs, unsigned npe, const MXDotp &dotp);
 
 /************************************************************
  *                      Class Definition                      *
@@ -146,7 +152,6 @@ class MXCore : public vp::Component {
 
     static bool                      power_of_two(unsigned value);
     static void                      append32(Bytes &bytes, uint32_t value);
-    static std::pair<Bytes, uint8_t> quantize(const std::array<uint32_t, 32> &block, bool enable_poison);
 
     // MXCore interfaces
     vp::Trace            trace;
@@ -167,7 +172,7 @@ class MXCore : public vp::Component {
     int64_t                total_runtime = 0; // Accumulated completed-job time in ns.
     uint64_t               num_matmul = 0;
 
-    // HWPE job control (one context)
+    // HWPE job control
     uint8_t  job_id_counter = 0;
     int      job_state = 0;      // 0: free to acquire; -2: acquired, not committed.
     uint8_t  running_job_id = 0; // RTL RUNNING counts retired jobs, modulo 256.
@@ -188,8 +193,8 @@ class MXCore : public vp::Component {
     unsigned bandwidth;
     MXDotp   dotp;
 
-    // MXCore registers (active fields are decoded at start_next_job())
-    std::array<uint32_t, NB_IO_REGS> reg_file{}; // Thirteen configuration words at 0x20..0x50.
+    // MXCore registers
+    std::array<uint32_t, NB_IO_REGS> reg_file{}; // gwaihir configuration words at 0x20..0x5c.
     unsigned                         m_size = 0;
     unsigned                         n_size = 0;
     unsigned                         k_size = 0;
@@ -199,15 +204,19 @@ class MXCore : public vp::Component {
     uint32_t                         scale_b_addr = 0;
     uint32_t                         z_addr = 0;
     uint32_t                         scale_z_addr = 0;
-    Fp8Format                        src_fmt = Fp8Format::E5M2;
-    bool                             quantize_output = false;
+    InputFormat                      src_fmt = InputFormat::E5M2;
+    unsigned                         elements_per_dotp = 0;
+    unsigned                         input_block_size = 32;
+    OutputFormat                     output_format = OutputFormat::FP32;
+    unsigned                         result_bits = 32;
+    bool                             quantize_mx = false;
     bool                             block_poison = false;
 
     // MXCore meta data
     // Programmed tile counts and tile sizes in bits; checked against M/N/K, VS, NPE and Reuse.
     unsigned a_row_tiles = 0;
     unsigned b_col_tiles = 0;
-    unsigned inner_tiles = 0;
+    unsigned inner_tiles = 0; // Programmed K/VS, distinct from FP4 compute chunks K/(2*VS).
     unsigned inner_blocks = 0;
     uint32_t a_tile_size = 0;
     uint32_t b_tile_size = 0;
@@ -230,9 +239,9 @@ class MXCore : public vp::Component {
     uint32_t                         scale_a_row_tile_bytes = 0;
     uint32_t                         scale_b_matrix_bytes = 0;
 
-    // Whole-job progress and circular global-output-buffer row pointers.
     uint64_t expected_bundles = 0;
     uint64_t compute_count = 0;
+    uint64_t retired_count = 0;
     uint64_t expected_rows = 0;
     uint64_t final_rows = 0;
     uint8_t  status = 0;
@@ -264,20 +273,19 @@ class MXCore : public vp::Component {
     FifoLanes                           scale_a_buffer;
     FifoLanes                           scale_b_buffer;
     std::array<Bytes, NB_INPUT_STREAMS> fence;
-    // i_mxdotp_array: one NPE-wide result, exception status and valid bit per stage.
+    
+    // one NPE-wide result, exception status and valid bit per stage.
     std::vector<std::vector<uint32_t>> dotp_result_buffer;
     std::vector<uint8_t>               dotp_result_status;
     std::vector<bool>                  dotp_result_valid;
-    // i_global_output_buffer: Reuse x NPE FP32 bits, row validity and final-row flags.
+    
+    //Reuse x NPE FP32 bits, row validity and final-row flags.
     std::vector<std::vector<uint32_t>> partial_sum_buffer;
     std::vector<bool>                  partial_sum_valid;
     std::vector<bool>                  partial_sum_final;
     std::deque<Bytes>                  result_buffer;
     std::deque<Bytes>                  result_scale_buffer;
 
-    // Per-slot request ownership/response state (model bookkeeping, not RTL FSM state)
-    // IoReq and payload are separate allocations, so vector growth keeps their
-    // addresses stable while memory owns a PENDING/DENIED request.
     struct ReqSlot {
         vp::IoReq       *req;
         uint8_t         *buf;
@@ -285,10 +293,9 @@ class MXCore : public vp::Component {
         mxcore_req_state state;
         uint64_t epoch;
         int64_t  issued_at;
-        // QUEUED: earliest issue; PENDING: INT64_MAX; RETURNED: earliest FIFO push.
-        // A returned read remains occupied until the input FIFO accepts it.
         int64_t available_at;
     };
+
     std::vector<ReqSlot> req_slots;
     std::array<std::deque<unsigned>, NB_STREAMS> pending;
     int      denied_req_slot = -1; // Denied request awaiting grant; -1 means none.
@@ -326,7 +333,7 @@ MXCore::MXCore(vp::ComponentConf &config)
         throw std::invalid_argument("Unsupported MXCore VS/NPE/Reuse/pipeline/TCDM configuration");
     }
 
-    // Initialize interfaces and the clocked FSM, as in LightRedmule.
+    // Initialize interfaces and the clocked FSM
     this->fsm_event = this->event_new(&MXCore::fsm_handler);
     this->input_itf.set_req_meth(&MXCore::req);
     this->new_slave_port("input", &this->input_itf);
@@ -409,8 +416,6 @@ void MXCore::clear_engine() {
         }
     }
 
-    // Target-owned PENDING/DENIED requests keep their IoReq/data alive. Their
-    // old epoch prevents late callbacks from writing into a subsequent job.
     this->a_buffer.clear();
     this->b_buffer.clear();
     this->scale_a_buffer.clear();
@@ -431,7 +436,7 @@ void MXCore::clear_engine() {
     this->clear_events();
 }
 
-// i_slave: every SOFT_CLEAR write clears control/data-path state; only zero
+// every SOFT_CLEAR write clears control/data-path state; only zero
 // also clears the register file and its job/finished counters.
 void MXCore::soft_clear(uint32_t value) {
     this->clear_engine();
@@ -457,7 +462,7 @@ vp::IoReqStatus MXCore::req(vp::Block *__this, vp::IoReq *req) {
     const uint64_t  offset = address & ~uint64_t(3);
     uint8_t         *data = req->get_data();
 
-    if (!data || !size || size > 4 || lane + size > 4 || offset > 0x50) {
+    if (!data || !size || size > 4 || lane + size > 4 || offset >= 0x20 + 4 * NB_IO_REGS) {
         return vp::IO_REQ_INVALID;
     }
 
@@ -478,14 +483,14 @@ vp::IoReqStatus MXCore::req(vp::Block *__this, vp::IoReq *req) {
             case 0x00: // TRIGGER: any write commits; zero also starts.
             {
                 int core = req->get_initiator();
-                // Ordinary ISS loads/stores may omit the initiator. A single
-                // core has an unambiguous event destination.
                 if (core == -1 && _this->num_cores == 1) {
                     core = 0;
                 }
+
                 if (core < 0 || unsigned(core) >= _this->num_cores) {
                     return vp::IO_REQ_INVALID;
                 }
+
                 _this->offloading_core = core;
                 try {
                     _this->commit(value == 0);
@@ -507,7 +512,7 @@ vp::IoReqStatus MXCore::req(vp::Block *__this, vp::IoReq *req) {
                 _this->check_state();
                 break;
             default:
-                break; // Other mandatory registers are read-only.
+                break;
             }
         }
     } else {
@@ -544,7 +549,7 @@ vp::IoReqStatus MXCore::req(vp::Block *__this, vp::IoReq *req) {
 
 int32_t MXCore::acquire() {
     if (this->job_state == -2) {
-        return -2; // RTL critical section takes priority over full-context status.
+        return -2; 
     }
     if (this->reg_busy.get()) {
         return -1;
@@ -555,7 +560,7 @@ int32_t MXCore::acquire() {
 
 void MXCore::commit(bool start) {
     this->job_state = 0;
-    // One context: no LightRedmule depth-two queue is introduced here.
+
     if (start && !this->reg_busy.get()) {
         this->start_next_job();
     }
@@ -565,62 +570,103 @@ void MXCore::commit(bool start) {
 }
 
 void MXCore::start_next_job() {
-    // Load the programmed MXCore registers (0x20 through 0x50).
     this->a_addr = this->reg_file[0];
     this->b_addr = this->reg_file[1];
     this->scale_a_addr = this->reg_file[2];
     this->scale_b_addr = this->reg_file[3];
-    this->z_addr = this->reg_file[4];
-    this->scale_z_addr = this->reg_file[5];
-    this->m_size = this->reg_file[6] & 0x3ff;
-    this->k_size = (this->reg_file[6] >> 10) & 0xfff;
-    this->n_size = (this->reg_file[6] >> 22) & 0x3ff;
-    const uint32_t ctrl = this->reg_file[7];
-    this->src_fmt = Fp8Format((ctrl >> 9) & 15);
-    this->quantize_output = (ctrl >> 21) & 1;
-    this->block_poison = (ctrl >> 22) & 1;
-    this->a_row_tiles = this->reg_file[8] & 15; // M / Reuse
-    this->b_col_tiles = (this->reg_file[8] >> 4) & 31; // N / NPE
-    this->inner_tiles = (this->reg_file[8] >> 9) & 127; // K / VS
-    this->inner_blocks = (this->reg_file[8] >> 16) & 127; // K / 32
-    this->a_tile_size = this->reg_file[9];
-    this->b_tile_size = this->reg_file[10];
-    this->result_tile_size = this->reg_file[11];
-    this->iter_count = this->reg_file[12] & 0xffff; // inner_tiles * Reuse
+    this->z_addr = this->reg_file[5];
+    this->scale_z_addr = this->reg_file[6];
+    this->m_size = this->reg_file[7] & 0x3ff;
+    this->k_size = (this->reg_file[7] >> 10) & 0xfff;
+    this->n_size = (this->reg_file[7] >> 22) & 0x3ff;
+    const uint32_t ctrl = this->reg_file[8];
+    this->src_fmt = InputFormat((ctrl >> 9) & 15);
+    const bool fp4 = this->src_fmt == InputFormat::E2M1;
+    this->elements_per_dotp = (fp4 ? 2u : 1u) * this->vs;
+    this->input_block_size = fp4 ? 64 : 32;
 
-    mxcore::get_fp8_info(this->src_fmt);
+    // Match gwaihir's highest-output-bit priority.
+    if (ctrl & (1u << 24)) {
+        this->output_format = OutputFormat::BF16;
+    } else if (ctrl & (1u << 23)) {
+        this->output_format = OutputFormat::E5M2;
+    } else if (ctrl & (1u << 22)) {
+        this->output_format = OutputFormat::E4M3;
+    } else if (ctrl & (1u << 21)) {
+        this->output_format = OutputFormat::E2M1;
+    } else {
+        this->output_format = OutputFormat::FP32;
+    }
+
+    this->result_bits = mxcore::output_bits(this->output_format);
+    this->quantize_mx = mxcore::output_has_scale(this->output_format);
+    this->block_poison = (ctrl >> 25) & 1;
+    this->a_row_tiles = this->reg_file[9] & 15; // M / Reuse
+    this->b_col_tiles = (this->reg_file[9] >> 4) & 31; // N / NPE
+    this->inner_tiles = (this->reg_file[9] >> 9) & 127; // K / VS
+    this->inner_blocks = (this->reg_file[9] >> 16) & 127; // K / input_block_size
+    this->a_tile_size = this->reg_file[10];
+    this->b_tile_size = this->reg_file[11];
+    this->result_tile_size = this->reg_file[13];
+    this->iter_count = this->reg_file[15] & 0xffff; // (K / elements_per_dotp) * Reuse
+
+    if (ctrl & (7u << 26)) {
+        throw std::invalid_argument("Preload and standalone quantization are not supported");
+    }
+
+    mxcore::get_input_encoding(this->src_fmt);
+
+    if (fp4) {
+        if (this->vs != 32) {
+            throw std::invalid_argument("gwaihir FP4 input requires hardware VS=32");
+        }
+    }
+
     const unsigned op = (ctrl >> 3) & 31;
     // Existing numerical contract: RNE, floating MXDOTP, FP32 accumulation.
     // SDOTP=19 is the workspace testbench encoding; MXDOTPF=22 is accepted too.
     if ((ctrl & 7) || ((ctrl >> 13) & 15) || (op != 19 && op != 22) || (ctrl & (1u << 20))) {
         throw std::invalid_argument("requires RNE, SDOTP/MXDOTPF, FP32 destination and flush=0");
     }
+
     if (!this->m_size || !this->n_size || !this->k_size || this->m_size % this->reuse ||
-        this->n_size % this->npe || this->k_size % this->vs || this->k_size % 32 ||
-        this->k_size / this->vs * uint64_t(this->reuse) > 65535) {
-        throw std::invalid_argument("requires full Reuse/NPE/VS tiles and 32-element blocks");
+        this->n_size % this->npe || this->k_size % this->elements_per_dotp ||
+        this->k_size % this->input_block_size ||
+        this->k_size / this->elements_per_dotp * uint64_t(this->reuse) > 65535) {
+        throw std::invalid_argument("requires full Reuse/NPE tiles and complete input vectors/scale blocks");
     }
+
+    const unsigned input_bits = fp4 ? 4u : 8u;
+    const unsigned compute_chunks = this->k_size / this->elements_per_dotp;
     if (this->a_row_tiles != this->m_size / this->reuse || this->b_col_tiles != this->n_size / this->npe ||
-        this->inner_tiles != this->k_size / this->vs || this->inner_blocks != this->k_size / 32 ||
-        this->a_tile_size != this->reuse * this->vs * 8 || this->b_tile_size != this->npe * this->vs * 8 ||
-        this->result_tile_size != this->reuse * this->npe * (this->quantize_output ? 8u : 32u) ||
-        this->iter_count != this->inner_tiles * this->reuse) {
+        this->inner_tiles != this->k_size / this->vs ||
+        this->inner_blocks != this->k_size / this->input_block_size ||
+        this->a_tile_size != this->reuse * this->vs * input_bits ||
+        this->b_tile_size != this->npe * this->vs * input_bits ||
+        this->result_tile_size != this->reuse * this->npe * this->result_bits ||
+        (this->quantize_mx && this->reg_file[14] != this->reuse * (this->npe / 32) * 8) ||
+        this->iter_count != compute_chunks * this->reuse ||
+        ((this->reg_file[9] >> 23) & 63) != std::min(32u / this->vs, compute_chunks)) {
         throw std::invalid_argument("inconsistent programmed tile counts/sizes/iteration count");
     }
-    if (!this->pipe_regs && this->k_size > this->vs) {
+
+    if (!this->pipe_regs && compute_chunks > 1) {
         throw std::invalid_argument("multi-chunk feedback requires a pipeline register");
     }
+
     if (!this->tcdm_itf.is_bound()) {
         throw std::logic_error("connect MXCore TCDM before triggering");
     }
+
     this->init_mxcore_meta_data();
     ++this->epoch;
     this->status = 0;
     this->in_count = this->out_count = this->partial_read_row = this->partial_write_row =
         this->result_read_row = 0;
     this->expected_rows = uint64_t(this->m_size) * this->n_size / this->npe;
-    this->expected_bundles = this->expected_rows * this->inner_tiles;
+    this->expected_bundles = this->expected_rows * compute_chunks;
     this->compute_count = 0;
+    this->retired_count = 0;
     this->final_rows = 0;
     this->fence = {};
     this->init_input_buffers();
@@ -628,9 +674,11 @@ void MXCore::start_next_job() {
     this->partial_sum_buffer.assign(this->reuse, std::vector<uint32_t>(this->npe));
     this->partial_sum_valid.assign(this->reuse, false);
     this->partial_sum_final.assign(this->reuse, false);
+
     for (auto &stage : this->dotp_result_buffer) {
         stage.clear();
     }
+
     this->dotp_result_valid.assign(this->pipe_regs, false);
     std::fill(this->dotp_result_status.begin(), this->dotp_result_status.end(), 0);
     this->timer_start = this->time.get_time();
@@ -651,9 +699,11 @@ void MXCore::finish_job() {
     this->total_runtime += period_ns;
     ++this->num_matmul;
     ++this->running_job_id;
+
     if (this->finished_count < 2) {
         ++this->finished_count;
     }
+
     this->reg_fsm_state.set(IDLE);
     this->reg_busy.set(0);
     this->context_status = 0;
@@ -664,11 +714,13 @@ void MXCore::finish_job() {
                     unsigned(this->status), (long long)this->total_runtime,
                     (unsigned long long)this->num_matmul);
     this->event_pending = true;
-    this->check_state(); // Clear the one-cycle completion pulse on the next clock.
+    this->check_state(); 
     const unsigned core = this->offloading_core;
-    if (this->events[core][0].is_bound()) {
-        this->events[core][0].sync(true);
+
+    if (this->events[core][1].is_bound()) {
+        this->events[core][1].sync(true);
     }
+
     if (this->done.is_bound()) {
         this->done.sync(true);
     }
@@ -680,11 +732,9 @@ void MXCore::init_mxcore_meta_data() {
                    kb = this->inner_blocks;
     const uint64_t bw = this->bandwidth * 8, a_tile = this->a_tile_size, b_tile = this->b_tile_size,
                    z_tile = this->result_tile_size;
-                   //reuse x k x 8
-    const uint64_t arow = a_tile * kt, 
-                   //K x N x 8
-                   bmat = b_tile * kt * bc;
-                   //scale: 8 bits, need kb = K / 32 scales
+    // INNER_TILES retains K/VS; FP4 tile sizes contain four bits per element.
+    const uint64_t arow = a_tile * kt, bmat = b_tile * kt * bc;
+    // E8M0 scales: K/32 blocks for FP8, K/64 for FP4.
     const uint64_t satile = this->reuse * 8, sarow = satile * kb, samat = sarow * ar,
                    sbmat = this->npe * 8 * kb * bc;
 
@@ -705,7 +755,7 @@ void MXCore::init_mxcore_meta_data() {
     }
 
     const uint64_t scale_bytes = uint64_t(this->m_size) * this->n_size / 32;
-    if (this->quantize_output && (this->bandwidth < this->npe / 32 ||
+    if (this->quantize_mx && (this->bandwidth < this->npe / 32 ||
                                   (scale_bytes >= this->bandwidth && scale_bytes % this->bandwidth))) {
         throw std::invalid_argument("RTL scale output needs supported integral/tail packing");
     }
@@ -744,7 +794,8 @@ uint32_t MXCore::get_routine_access_block_number() {
     this->stream_total[STREAM_B] = uint64_t(this->b_matrix_bytes) * this->a_row_tiles / this->bandwidth;
 
     if (this->reuse > this->bandwidth) {
-        this->stream_total[STREAM_SA] = uint64_t(this->reuse) * (32 / this->vs) * this->inner_blocks *
+        this->stream_total[STREAM_SA] = uint64_t(this->reuse) *
+                                        (this->input_block_size / this->elements_per_dotp) * this->inner_blocks *
                                         this->b_col_tiles / this->bandwidth;
     } else {
         this->stream_total[STREAM_SA] =
@@ -767,7 +818,7 @@ uint32_t MXCore::get_storing_access_block_number() {
         uint64_t(this->result_tile_size) * this->a_row_tiles * this->b_col_tiles / (this->bandwidth * 8);
     const uint64_t scale_bytes = uint64_t(this->m_size) * this->n_size / 32;
     this->stream_total[STREAM_SZ] =
-        this->quantize_output ? std::max(uint64_t(1), scale_bytes / this->bandwidth) : 0;
+        this->quantize_mx ? std::max(uint64_t(1), scale_bytes / this->bandwidth) : 0;
     return this->stream_total[STREAM_Z] + this->stream_total[STREAM_SZ];
 }
 
@@ -788,8 +839,6 @@ void MXCore::init_req_slot(unsigned slot_id) {
     std::memcpy(slot.req->arg_get(0), &slot_id, sizeof(slot_id));
 }
 
-// Five depth-two outgoing HCI FIFOs; Z and SZ share the result channel.
-// Accepted requests retain their slots but no longer occupy outgoing capacity.
 bool MXCore::issue_slot_gate_ok(unsigned stream) const {
     const unsigned channel = stream == STREAM_SZ ? STREAM_Z : stream;
     unsigned       count = 0;
@@ -839,7 +888,6 @@ bool MXCore::all_slots_free() const {
     return true;
 }
 
-// i_streamer
 void MXCore::enqueue_read_requests(const std::array<bool, NB_INPUT_STREAMS> &room) {
     for (unsigned i = 0; i < NB_INPUT_STREAMS; ++i) {
         if (room[i] && !this->stream_done(i) && this->issue_slot_gate_ok(i)) {
@@ -852,7 +900,6 @@ void MXCore::enqueue_read_requests(const std::array<bool, NB_INPUT_STREAMS> &roo
     }
 }
 
-// i_result_stream_sink / i_result_scale_stream_sink
 void MXCore::enqueue_write_request(bool z, bool sz) {
     if ((!z && !sz) || !this->issue_slot_gate_ok(STREAM_Z)) {
         return;
@@ -866,7 +913,6 @@ void MXCore::enqueue_write_request(bool z, bool sz) {
     this->prefer_scale = i == STREAM_Z;
 }
 
-// i_streamer
 void MXCore::handle_response(unsigned slot_id, int64_t response_cycle) {
     ReqSlot &slot = this->req_slots[slot_id];
     if (slot.req->status == vp::IO_REQ_INVALID) {
@@ -904,7 +950,7 @@ int MXCore::arbitrate_request() {
     if (this->denied_req_slot >= 0 || now < this->next_bus_cycle) {
         return -1;
     }
-    // i_ldst_mux
+
     int selected = -1;
     for (unsigned stream = 0; stream < NB_STREAMS; ++stream) {
         for (auto index : this->pending[stream]) {
@@ -925,8 +971,6 @@ int MXCore::arbitrate_request() {
     return selected;
 }
 
-// The arbiter selects an already queued request. Address, size, stream and
-// store data were captured when it entered its outgoing FIFO.
 void MXCore::issue_request(unsigned slot_id) {
     const auto now = this->clock.get_cycles();
     ReqSlot   &slot = this->req_slots[slot_id];
@@ -943,10 +987,8 @@ void MXCore::issue_request(unsigned slot_id) {
     } else if (response != vp::IO_REQ_PENDING) {
         this->trace.fatal("MXCore invalid TCDM response\n");
     }
-    // One wide transfer per cycle; all streams share this bandwidth.
 }
 
-// i_streamer
 void MXCore::process_responses() {
     const auto now = this->clock.get_cycles();
     for (unsigned i = 0; i < this->req_slots.size(); ++i) {
@@ -980,29 +1022,31 @@ void MXCore::process_responses() {
  *                   Compute Engine and FSM                   *
  ************************************************************/
 
-// i_global_output_buffer / i_result_quantizer
-// Called only after process_compute has captured this cycle's ready/valid state.
 void MXCore::process_iter_instruction() {
     const auto &last = this->partial_sum_buffer[this->result_read_row];
     Bytes       values, scales;
-    if (this->quantize_output) {
-        // i_result_quantizer
+
+    if (this->quantize_mx) {
         for (unsigned group = 0; group < this->npe; group += 32) {
             std::array<uint32_t, 32> block;
             std::copy_n(last.begin() + group, 32, block.begin());
-            auto q = quantize(block, this->block_poison);
-            values.insert(values.end(), q.first.begin(), q.first.end());
-            scales.push_back(q.second);
+            auto q = mxcore::quantize_block(block, this->output_format, this->block_poison);
+            values.insert(values.end(), q.data.begin(), q.data.end());
+            scales.push_back(q.scale);
         }
-        // i_result_scale_mx_buffer
         this->output_push(1, std::move(scales));
+    } else if (this->output_format == OutputFormat::BF16) {
+        for (uint32_t bits : last) {
+            const uint16_t value = mxcore::quantize_bf16(bits);
+            values.push_back(uint8_t(value));
+            values.push_back(uint8_t(value >> 8));
+        }
     } else {
-        // i_result_buffer
         for (auto bits : last) {
             append32(values, bits);
         }
     }
-    // i_result_mx_buffer / i_result_buffer
+
     this->output_push(0, std::move(values));
     this->partial_sum_valid[this->result_read_row] = false;
     this->partial_sum_final[this->result_read_row] = false;
@@ -1010,8 +1054,6 @@ void MXCore::process_iter_instruction() {
     ++this->final_rows;
 }
 
-// i_streamer / input and result FIFOs. instr is the six-stream load/store code.
-// Return the valid transfer size: quantized scale stores may have a short tail.
 unsigned MXCore::process_iter_instruction(uint8_t *buf, unsigned instr) {
     switch (instr) {
     case STREAM_A:
@@ -1044,7 +1086,6 @@ unsigned MXCore::process_iter_instruction(uint8_t *buf, unsigned instr) {
     }
 }
 
-// i_global_output_buffer / i_reuse_counters
 void MXCore::retire_result(std::vector<uint32_t> result, uint8_t flags) {
     const unsigned row = this->partial_write_row;
     this->partial_sum_buffer[row] = std::move(result);
@@ -1054,22 +1095,18 @@ void MXCore::retire_result(std::vector<uint32_t> result, uint8_t flags) {
     this->partial_write_row = (row + 1) % this->reuse;
 }
 
-// i_engine / i_mxcore_engine
 void MXCore::process_compute() {
-    // i_global_output_buffer
     const unsigned result_row = this->result_read_row;
     const bool     drain = this->partial_sum_valid[result_row] && this->partial_sum_final[result_row] &&
-                       this->output_can_push(0) && (!this->quantize_output || this->output_can_push(1));
+                       this->output_can_push(0) && (!this->quantize_mx || this->output_can_push(1));
     const bool write_ready = !this->partial_sum_valid[this->partial_write_row];
     
-    // i_mxdotp_array
     std::vector<bool> ready(this->pipe_regs);
     for (int i = int(this->pipe_regs) - 1; i >= 0; --i) {
         ready[i] =
             !this->dotp_result_valid[i] || (i + 1 == int(this->pipe_regs) ? write_ready : ready[i + 1]);
     }
 
-    // i_reuse_counters
     const bool     first = this->in_count < this->reuse;
     const unsigned feedback_row = this->partial_read_row;
     auto          &partial = this->partial_sum_buffer[feedback_row];
@@ -1078,7 +1115,6 @@ void MXCore::process_compute() {
     const bool engine_ready = this->compute_count < this->expected_bundles && feedback_ready &&
                               (this->pipe_regs ? ready[0] : write_ready);
     
-    // i_input_fence
     bool all_valid = true;
     for (unsigned i = 0; i < NB_INPUT_STREAMS; ++i) {
         all_valid &= !this->fence[i].empty() || this->input_valid(i);
@@ -1121,8 +1157,11 @@ void MXCore::process_compute() {
             computed_bits.resize(this->npe);
             const uint32_t *d = first ? nullptr : partial.data();
 
-            // i_mxdotp_array
-            if (this->src_fmt == mxcore::Fp8Format::E4M3) {
+            if (this->src_fmt == InputFormat::E2M1) {
+                computed_status = matmul_fp4(computed_bits.data(), d, operands[0].data(),
+                                             operands[1].data(), operands[2].data(), operands[3].data(),
+                                             this->vs, this->npe, this->dotp);
+            } else if (this->src_fmt == InputFormat::E4M3) {
                 computed_status = matmul_fp8e4m3(computed_bits.data(), d, operands[0].data(),
                                                  operands[1].data(), operands[2].data(), operands[3].data(),
                                                  1, this->vs, this->vs, this->npe, this->reuse, this->dotp);
@@ -1161,6 +1200,13 @@ void MXCore::process_compute() {
     
     if (retire_valid) {
         this->retire_result(std::move(retired_bits), retired_status);
+        if (++this->retired_count == this->expected_bundles) {
+            //event 0 reports compute completion; event 1 reports completed output stores.
+            if (this->events[this->offloading_core][0].is_bound()) {
+                this->events[this->offloading_core][0].sync(true);
+            }
+            this->event_pending = true;
+        }
     }
 
     const bool last_iteration = this->next_iteration(compute_valid, retire_valid);
@@ -1169,7 +1215,6 @@ void MXCore::process_compute() {
     }
 }
 
-// i_reuse_counters
 bool MXCore::next_iteration(bool count_in, bool count_out) {
     if (count_in) {
         this->in_count = (this->in_count + 1) % this->iter_count;
@@ -1296,7 +1341,8 @@ uint32_t MXCore::next_addr(unsigned stream) {
                 const unsigned tile_beats = this->reuse / this->bandwidth;
                 if (count % tile_beats == 0) {
                     // Large Scale A: replay each scale tile 32/VS times.
-                    const unsigned block = count / tile_beats / (32 / this->vs) % this->inner_blocks;
+                    const unsigned block = count / tile_beats /
+                                             (this->input_block_size / this->elements_per_dotp) % this->inner_blocks;
                     this->iter_scale_a_addr = this->calculate_tile_base_address(
                         this->scale_a_addr, this->reuse, this->inner_blocks, 0, block);
                 }
@@ -1364,7 +1410,7 @@ void MXCore::init_input_buffers() {
     }
     
     this->scale_b_short =
-        uint64_t(this->npe) * (this->k_size / 32) * (this->n_size / this->npe) < this->bandwidth;
+        uint64_t(this->npe) * this->inner_blocks * this->b_col_tiles < this->bandwidth;
 }
 
 FifoLanes &MXCore::get_input_buffer(unsigned stream) {
@@ -1402,9 +1448,6 @@ bool MXCore::input_can_reserve(unsigned stream) const {
     const auto     &reserved = this->input_reserved[stream];
     const unsigned &reserve_lane = this->input_reserve_lane[stream];
 
-    // Keep the depth-two HCI response FIFO separate from the per-lane
-    // input FIFOs. Reserving only input FIFO space would lose buffering
-    // and make a delayed response artificially throttle the request bus.
     if (fifo[reserve_lane].size() + reserved[reserve_lane] < STREAM_FIFO_DEPTH) {
         return true;
     }
@@ -1471,7 +1514,7 @@ void MXCore::input_pop(unsigned stream) {
     const unsigned beat = this->bandwidth;
     const unsigned output = this->input_width[stream];
     const unsigned reuse = this->reuse;
-    const unsigned factor = 32 / this->vs;
+    const unsigned factor = this->input_block_size / this->elements_per_dotp;
     const bool     short_b = this->scale_b_short;
     auto          &fifo = this->get_input_buffer(stream);
     unsigned      &slice = this->input_slice[stream];
@@ -1531,7 +1574,7 @@ void MXCore::input_pop(unsigned stream) {
 void MXCore::init_output_buffers() {
     this->result_buffer.clear();
     this->result_scale_buffer.clear();
-    this->output_row_bytes = {this->npe * (this->quantize_output ? 1u : 4u), this->npe / 32};
+    this->output_row_bytes = {this->npe * this->result_bits / 8, this->npe / 32};
     
     for (unsigned output = 0; output < NB_OUTPUT_STREAMS; ++output) {
         this->output_lanes[output] = std::max(1u, this->bandwidth / this->output_row_bytes[output]);
@@ -1612,7 +1655,6 @@ void MXCore::output_pop(unsigned output) {
     }
 }
 
-// i_result_buffer
 void MXCore::append32(Bytes &bytes, uint32_t value) {
     for (unsigned i = 0; i < 4; ++i) {
         bytes.push_back(uint8_t(value >> (8 * i)));
@@ -1620,7 +1662,7 @@ void MXCore::append32(Bytes &bytes, uint32_t value) {
 }
 
 /************************************************************
- *                 FP8 Matrix Multiplication                  *
+ *               MXFP8 / MXFP4 Matrix Multiplication           *
  ************************************************************/
 
 struct MxcoreFp32Result {
@@ -1628,7 +1670,6 @@ struct MxcoreFp32Result {
     uint8_t  status;
 };
 
-// i_fpnew_mxdotp_multi
 static MxcoreFp32Result round_fp32(const MXDotp::Result &r, const MXDotp::Parameters &p) {
     // i_special_assemble
     if (r.special_raw & 8) {
@@ -1683,7 +1724,24 @@ static MxcoreFp32Result round_fp32(const MXDotp::Result &r, const MXDotp::Parame
                     ((absolute >> 23) == 0 && inexact ? FpStatus::UF : 0))};
 }
 
-// i_mxdotp_array
+uint8_t matmul_fp4(uint32_t *z, const uint32_t *d, const uint8_t *a, const uint8_t *b,
+                   const uint8_t *scale_a, const uint8_t *scale_b,
+                   unsigned vs, unsigned npe, const MXDotp &dotp) {
+    uint8_t status = 0;
+    for (unsigned col = 0; col < npe; ++col) {
+        auto input = dotp.make_inputs();
+        std::copy_n(a, vs, input.a.begin());
+        std::copy_n(b + col * vs, vs, input.b.begin());
+        input.scale_a = scale_a[0];
+        input.scale_b = scale_b[col];
+        input.d_bits = d ? d[col] : 0;
+        const auto result = round_fp32(dotp.compute(input, InputFormat::E2M1), dotp.parameters());
+        z[col] = result.bits;
+        status |= result.status;
+    }
+    return status;
+}
+
 uint8_t matmul_fp8e4m3(uint32_t *z, const uint32_t *d, const fp8e4m3 *a, const fp8e4m3 *b,
                        const uint8_t *scale_a, const uint8_t *scale_b, unsigned m_size, unsigned k_size,
                        unsigned vs, unsigned npe, unsigned reuse, const MXDotp &dotp) {
@@ -1706,7 +1764,7 @@ uint8_t matmul_fp8e4m3(uint32_t *z, const uint32_t *d, const fp8e4m3 *a, const f
                 input.d_bits = accumulator;
                 // i_fpnew_mxdotp_multi
                 const auto result =
-                    round_fp32(dotp.compute(input, mxcore::Fp8Format::E4M3), dotp.parameters());
+                    round_fp32(dotp.compute(input, InputFormat::E4M3), dotp.parameters());
                 accumulator = result.bits;
                 status |= result.status;
             }
@@ -1716,7 +1774,6 @@ uint8_t matmul_fp8e4m3(uint32_t *z, const uint32_t *d, const fp8e4m3 *a, const f
     return status;
 }
 
-// i_mxdotp_array
 uint8_t matmul_fp8e5m2(uint32_t *z, const uint32_t *d, const fp8e5m2 *a, const fp8e5m2 *b,
                        const uint8_t *scale_a, const uint8_t *scale_b, unsigned m_size, unsigned k_size,
                        unsigned vs, unsigned npe, unsigned reuse, const MXDotp &dotp) {
@@ -1739,7 +1796,7 @@ uint8_t matmul_fp8e5m2(uint32_t *z, const uint32_t *d, const fp8e5m2 *a, const f
                 input.d_bits = accumulator;
                 // i_fpnew_mxdotp_multi
                 const auto result =
-                    round_fp32(dotp.compute(input, mxcore::Fp8Format::E5M2), dotp.parameters());
+                    round_fp32(dotp.compute(input, InputFormat::E5M2), dotp.parameters());
                 accumulator = result.bits;
                 status |= result.status;
             }
@@ -1747,58 +1804,6 @@ uint8_t matmul_fp8e5m2(uint32_t *z, const uint32_t *d, const fp8e5m2 *a, const f
         }
     }
     return status;
-}
-
-/************************************************************
- *                    Result Quantization                     *
- ************************************************************/
-
-// i_result_quantizer
-std::pair<Bytes, uint8_t> MXCore::quantize(const std::array<uint32_t, 32> &block, bool enable_poison) {
-    // i_block_scale
-    unsigned maximum = 0;
-    bool     poison = false;
-    
-    for (uint32_t x : block) {
-        const unsigned exponent = (x >> 23) & 255;
-        maximum = std::max(maximum, exponent);
-        poison |= exponent == 255;
-    }
-    
-    const int scale = std::clamp(int(maximum) - 142, -127, 127);
-    Bytes     result;
-    // i_quantizer
-    for (uint32_t x : block) {
-        const auto f = mxcore::decode_fp32(x);
-        uint8_t    absolute = 0;
-        if (poison && enable_poison) {
-            result.push_back(0x7d);
-            continue;
-        }
-        if (f.nan) {
-            absolute = 0x7d;
-        } else if (f.inf) {
-            absolute = 0x7b;
-        } else if (f.exponent || f.fraction) {
-            const int scaled = (f.exponent ? int(f.exponent) - 127 : -126) - scale;
-            if (scaled > 15) {
-                absolute = 0x7b;
-            } else {
-                const unsigned shift = std::clamp(-14 - scaled, 0, 24);
-                const uint32_t mantissa = ((f.exponent ? 0x800000u : 0) | f.fraction) >> shift;
-                uint32_t       rounded = mantissa >> 21;
-                rounded += ((mantissa >> 20) & 1) && ((mantissa & 0xfffffu) || (rounded & 1));
-                if (!shift) {
-                    const int exponent = scaled + 15 + ((rounded >> 3) & 1);
-                    absolute = exponent >= 31 ? 0x7b : uint8_t((exponent << 2) | (rounded & 3));
-                } else {
-                    absolute = (rounded & 4) ? 4 : rounded & 3;
-                }
-            }
-        }
-        result.push_back(uint8_t((unsigned(f.sign) << 7) | absolute));
-    }
-    return {std::move(result), uint8_t(scale)};
 }
 
 /************************************************************

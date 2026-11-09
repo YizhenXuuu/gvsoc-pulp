@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fp8.hpp"
+#include "input_fmt.hpp"
 
 #include <climits>
 #include <cstddef>
@@ -15,8 +15,7 @@ class MXDotp {
   public:
     using DotpWide = __int128;
 
-    // FP8/FP32 format and fixed accumulator-layout constants, independent of lane count.
-    static constexpr unsigned DotpFractionBits = Fp8FractionBits;
+    static constexpr unsigned DotpFractionBits = InputFractionBits;
     static constexpr unsigned DotpFp32FractionBits = Fp32FractionBits;
     static constexpr unsigned DotpPrecisionBits = DotpFractionBits + 1;
     static constexpr unsigned DotpFp32PrecisionBits = DotpFp32FractionBits + 1;
@@ -111,10 +110,12 @@ class MXDotp {
     Inputs make_inputs() const {
         return Inputs(parameters_.vector_size);
     }
-    Result compute(const Inputs &input, Fp8Format format) const;
+
+    Result compute(const Inputs &input, InputFormat format) const;
 
   private:
     static Parameters make_parameters(std::size_t vector_size);
+    Result            accumulate(Result result, const Inputs &input) const;
     Parameters        parameters_;
 };
 
