@@ -495,8 +495,9 @@ vp::IoReqStatus MXCore::req(vp::Block *__this, vp::IoReq *req) {
                 try {
                     _this->commit(value == 0);
                 } catch (const std::exception &error) {
-                    _this->trace.msg(vp::TraceLevel::WARNING, "Unsupported MXCore configuration: %s\n",
-                                     error.what());
+                    _this->trace.force_warning_no_error("Unsupported MXCore configuration: %s\n",
+                                                       error.what());
+                    _this->time.get_engine()->quit(1);
                     return vp::IO_REQ_INVALID;
                 }
                 break;
@@ -581,6 +582,7 @@ void MXCore::start_next_job() {
     this->n_size = (this->reg_file[7] >> 22) & 0x3ff;
     const uint32_t ctrl = this->reg_file[8];
     this->src_fmt = InputFormat((ctrl >> 9) & 15);
+    mxcore::get_input_encoding(this->src_fmt);
     const bool fp4 = this->src_fmt == InputFormat::E2M1;
     this->elements_per_dotp = (fp4 ? 2u : 1u) * this->vs;
     this->input_block_size = fp4 ? 64 : 32;
@@ -613,8 +615,6 @@ void MXCore::start_next_job() {
     if (ctrl & (7u << 26)) {
         throw std::invalid_argument("Preload and standalone quantization are not supported");
     }
-
-    mxcore::get_input_encoding(this->src_fmt);
 
     if (fp4) {
         if (this->vs != 32) {
