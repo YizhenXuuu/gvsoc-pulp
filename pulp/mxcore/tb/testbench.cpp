@@ -18,6 +18,7 @@ public:
         input_format = get_js_config()->get_child_str("input_format");
         output_format = get_js_config()->get_child_str("output_format");
         output_file = get_js_config()->get_child_str("output_file");
+        preload = get_js_config()->get_child_int("preload");
         M = get_js_config()->get_child_int("m");
         K = get_js_config()->get_child_int("k");
         N = get_js_config()->get_child_int("n");
@@ -44,12 +45,12 @@ public:
         result_base = scale_b_base + N * (K / input_block);
         scale_bytes = result_bits <= 8 ? M * N / 32 : 0;
         result_bytes = M * N * result_bits / 8;
-        scale_base = result_base + result_bytes;
+        scale_base = result_base + (preload ? M * N * 4 : result_bytes);
         memory.resize(scale_base + scale_bytes + Bandwidth);
 
         registers = {ABase, b_base, scale_a_base, scale_b_base, result_base, result_base, scale_base,
                      (N << 22) | (K << 10) | M,
-                     input_control | (19u << 3) | output_control,
+                     input_control | (19u << 3) | output_control | (uint32_t(preload) << 26),
                      ((reuse_d_reg_size & 63u) << 23) | ((inner_blocks & 127u) << 16) |
                          ((inner_tiles & 127u) << 9) | ((b_col_tiles & 31u) << 4) | (a_row_tiles & 15u),
                      Reuse * VS * input_bits, NPE * VS * input_bits, Reuse * NPE * 32,
@@ -84,6 +85,7 @@ private:
     vp::WireSlave<bool> completion;
     vp::ClockEvent timer;
     bool started = false;
+    bool preload = false;
     std::array<uint32_t, 16> registers{};
     std::vector<uint8_t> memory;
     unsigned b_base, scale_a_base, scale_b_base, result_base;
@@ -96,6 +98,8 @@ private:
         if (!input) throw std::runtime_error("Cannot open input binary: " + input_file);
         const std::streamsize bytes = input.tellg();
         if (bytes < 0) throw std::runtime_error("Cannot determine input binary size: " + input_file);
+        if (preload && bytes < std::streamsize(result_base) + M * N * 4)
+            throw std::runtime_error("Preload binary must contain A, B, ScaleA, ScaleB and FP32 C");
         if (std::size_t(bytes) > memory.size()) memory.resize(bytes, 0xa5);
         input.seekg(0);
         input.read(reinterpret_cast<char *>(memory.data() + ABase), bytes);
@@ -123,12 +127,16 @@ private:
             std::cout << "[TB] Input=" << self.input_file << ", format=" << self.input_format
                       << ", M=" << self.M << " K=" << self.K << " N=" << self.N
                       << ", VS=" << self.VS << " Reuse=" << self.Reuse << " NPE=" << self.NPE
-                      << ", output=" << self.output_format << '\n';
+                      << ", output=" << self.output_format << ", preload=" << self.preload << '\n';
+
             self.peripheral(0x14, true, 0);
+
             if (int32_t(self.peripheral(0x04, false)) < 0)
                 throw std::runtime_error("MXCore did not grant a job context");
+
             for (unsigned index = 0; index < self.registers.size(); ++index)
                 self.peripheral(0x20 + index * 4, true, self.registers[index]);
+                
             std::cout << "[TB] Triggering MXCore\n";
             self.started = true;
             self.timer.enqueue(TimeoutCycles);
@@ -156,7 +164,8 @@ private:
     void save_output() const {
         std::ofstream output(output_file, std::ios::binary);
         if (!output) throw std::runtime_error("Cannot create testbench output file");
-        output.write(reinterpret_cast<const char *>(memory.data() + result_base), result_bytes + scale_bytes);
+        output.write(reinterpret_cast<const char *>(memory.data() + result_base), result_bytes);
+        output.write(reinterpret_cast<const char *>(memory.data() + scale_base), scale_bytes);
         if (!output) throw std::runtime_error("Cannot write testbench output file");
         std::cout << "[TB] Saved " << result_bytes + scale_bytes << " bytes to " << output_file << '\n'
                   << "[TB] Execution finished.\n";

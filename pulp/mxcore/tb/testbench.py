@@ -9,19 +9,25 @@ class Testbench(gvsoc.systree.Component):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/mxcore/tb/testbench.cpp'])
-
         binary = TargetParameter(self, name='binary', value='input.bin',
-                                 description='MXCore input binary').get_value()
+                                 description='MXCore input binary').get_value()        
         input_format = TargetParameter(self, name='input', value='fp8',
-                                       description='MXCore input format').get_value()
+                                       description='MXCore input format').get_value()    
         output_format = TargetParameter(self, name='output', value='fp32',
                                         description='MXCore output format').get_value()
+        preload = TargetParameter(self, name='preload', value=0,
+                                  description='Preload FP32 accumulator from the C region').get_value()
+        
+        if preload not in (0, 1):
+            raise ValueError('MXCore preload must be 0 or 1')
+        
         output_file = TargetParameter(self, name='output_file',
                                       value=str(Path(__file__).resolve().parent / 'output_tb/output.bin'),
                                       description='MXCore output binary').get_value()
+        
         self.add_properties(self.get_format_config(input_format, output_format))
         self.add_properties(dict(input_file=binary, input_format=input_format,
-                                 output_format=output_format, output_file=output_file,
+                                 output_format=output_format, output_file=output_file, preload=preload,
                                  m=m, k=k, n=n, vector_size=vs, reuse=reuse, npe=npe))
 
     @staticmethod
@@ -31,6 +37,7 @@ class Testbench(gvsoc.systree.Component):
             'e4m3': (5 << 9, 8, 32),
             'fp4': (8 << 9, 4, 64),
         }
+
         outputs = {
             'fp32': (0, 32),
             'bf16': (1 << 24, 16),
@@ -38,10 +45,13 @@ class Testbench(gvsoc.systree.Component):
             'e4m3': (1 << 22, 8),
             'fp4': (1 << 21, 4),
         }
+
         if output_format not in outputs:
             raise ValueError(f'MXCore unsupported output format: {output_format}')
+        
         input_control, input_bits, input_block_size = inputs.get(input_format, (15 << 9, 8, 32))
         output_control, result_bits = outputs[output_format]
+
         return dict(input_control=input_control, input_bits=input_bits, input_block_size=input_block_size,
                     output_control=output_control, result_bits=result_bits)
 

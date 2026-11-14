@@ -3,6 +3,7 @@ GVSOC_WORKDIR ?= $(abspath $(CURDIR)/../build/test)
 binary ?= input.bin
 input ?= fp8
 output ?= fp32
+preload ?= 0
 m ?= 64
 k ?= 64
 n ?= 32
@@ -31,6 +32,7 @@ run: gvsoc
 		--parameter="soc/testbench/binary=$(abspath $(binary))" \
 		--parameter="soc/testbench/input=$(input)" \
 		--parameter="soc/testbench/output=$(output)" \
+		--parameter="soc/testbench/preload=$(preload)" \
 		--parameter="soc/testbench/output_file=$(OUTPUT_DIR)/output.bin" run $(runner_args)
 
 clean:

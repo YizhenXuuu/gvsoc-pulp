@@ -44,6 +44,7 @@ enum mxcore_stream : unsigned {
     STREAM_SB,
     STREAM_Z,
     STREAM_SZ,
+    STREAM_C,
     NB_STREAMS
 };
 
@@ -56,7 +57,7 @@ enum mxcore_req_state {
 
 static constexpr unsigned NB_INPUT_STREAMS = 4;
 static constexpr unsigned NB_OUTPUT_STREAMS = 2;
-static constexpr unsigned NB_TCDM_CHANNELS = 5;
+static constexpr unsigned NB_TCDM_CHANNELS = 6;
 static constexpr unsigned STREAM_FIFO_DEPTH = 2;
 static constexpr unsigned NB_IO_REGS = 16;
 static constexpr unsigned MAX_CORES = 16;
@@ -105,6 +106,7 @@ class MXCore : public vp::Component {
     void    init_mxcore_meta_data();
     void    check_state();
     void    process_compute();
+    void    process_preload();
     void    retire_result(std::vector<uint32_t> result, uint8_t flags);
     bool    finished() const;
 
@@ -144,6 +146,7 @@ class MXCore : public vp::Component {
     void     free_req_slot(unsigned slot_id);
     bool     all_slots_free() const;
     void     enqueue_read_requests(const std::array<bool, NB_INPUT_STREAMS> &room);
+    void     enqueue_preload_request(bool room);
     void     enqueue_write_request(bool result_valid, bool scale_valid);
     int      arbitrate_request();
     void     issue_request(unsigned slot_id);
@@ -189,6 +192,7 @@ class MXCore : public vp::Component {
     unsigned npe;
     unsigned reuse;
     unsigned pipe_regs;
+    unsigned preload_threshold;
     unsigned num_cores; // CPU cores with completion-event outputs.
     unsigned bandwidth;
     MXDotp   dotp;
@@ -202,6 +206,7 @@ class MXCore : public vp::Component {
     uint32_t                         b_addr = 0;
     uint32_t                         scale_a_addr = 0;
     uint32_t                         scale_b_addr = 0;
+    uint32_t                         preload_addr = 0;
     uint32_t                         z_addr = 0;
     uint32_t                         scale_z_addr = 0;
     InputFormat                      src_fmt = InputFormat::E5M2;
@@ -211,6 +216,7 @@ class MXCore : public vp::Component {
     unsigned                         result_bits = 32;
     bool                             quantize_mx = false;
     bool                             block_poison = false;
+    bool                             preload = false;
 
     // MXCore meta data
     // Programmed tile counts and tile sizes in bits; checked against M/N/K, VS, NPE and Reuse.
@@ -232,6 +238,7 @@ class MXCore : public vp::Component {
     uint32_t                         iter_scale_b_addr = 0;
     uint32_t                         iter_z_addr = 0;
     uint32_t                         iter_scale_z_addr = 0;
+    uint32_t                         iter_preload_addr = 0;
     std::array<uint32_t, NB_STREAMS> stream_total{};
     std::array<uint32_t, NB_STREAMS> stream_issued{}; // Beats enqueued; drives address progression.
     uint32_t                         a_row_tile_bytes = 0;
@@ -285,6 +292,14 @@ class MXCore : public vp::Component {
     std::vector<bool>                  partial_sum_final;
     std::deque<Bytes>                  result_buffer;
     std::deque<Bytes>                  result_scale_buffer;
+    std::deque<Bytes>                  preload_buffer;
+    unsigned                           preload_reserved = 0;
+    unsigned                           preload_row = 0;
+    unsigned                           preload_word = 0;
+    unsigned                           preload_count = 0;
+    unsigned                           preload_final_count = 0;
+    bool                               preload_wait = false;
+    bool                               preload_push_ready = false;
 
     struct ReqSlot {
         vp::IoReq       *req;
@@ -323,13 +338,19 @@ MXCore::MXCore(vp::ComponentConf &config)
     this->npe = get_js_config()->get("npe")->get_int();
     this->reuse = get_js_config()->get("reuse")->get_int();
     this->pipe_regs = get_js_config()->get("num_pipe_regs")->get_int();
+    this->preload_threshold = get_js_config()->get("preload_threshold")->get_int();
     this->num_cores = get_js_config()->get("num_cores")->get_int();
     this->bandwidth = this->tcdm_bank_width * this->tcdm_bank_number;
+
+    if (this->pipe_regs != 4) {
+        throw std::invalid_argument("MXCore requires four pipeline stages to match fpnew_mxdotp_multi_opt");
+    }
 
     if (!power_of_two(this->vs) || this->vs < 2 || this->vs > 32 || !power_of_two(this->npe) ||
         this->npe < 32 || this->npe > 512 || !power_of_two(this->reuse) || this->reuse < 2 ||
         this->reuse > 512 || !power_of_two(this->bandwidth) || this->bandwidth < std::max(4u, this->vs) ||
-        this->bandwidth > 512 || this->pipe_regs > 64 || !this->num_cores || this->num_cores > MAX_CORES) {
+        this->bandwidth > 512 || this->preload_threshold > this->reuse ||
+        !this->num_cores || this->num_cores > MAX_CORES) {
         throw std::invalid_argument("Unsupported MXCore VS/NPE/Reuse/pipeline/TCDM configuration");
     }
 
@@ -426,6 +447,10 @@ void MXCore::clear_engine() {
     this->partial_sum_final.clear();
     this->result_buffer.clear();
     this->result_scale_buffer.clear();
+    this->preload_buffer.clear();
+    this->preload_reserved = 0;
+    this->preload_row = this->preload_word = this->preload_count = this->preload_final_count = 0;
+    this->preload_wait = this->preload_push_ready = false;
 
     for (auto &stage : this->dotp_result_buffer) {
         stage.clear();
@@ -575,6 +600,7 @@ void MXCore::start_next_job() {
     this->b_addr = this->reg_file[1];
     this->scale_a_addr = this->reg_file[2];
     this->scale_b_addr = this->reg_file[3];
+    this->preload_addr = this->reg_file[4];
     this->z_addr = this->reg_file[5];
     this->scale_z_addr = this->reg_file[6];
     this->m_size = this->reg_file[7] & 0x3ff;
@@ -603,6 +629,7 @@ void MXCore::start_next_job() {
     this->result_bits = mxcore::output_bits(this->output_format);
     this->quantize_mx = mxcore::output_has_scale(this->output_format);
     this->block_poison = (ctrl >> 25) & 1;
+    this->preload = (ctrl >> 26) & 1;
     this->a_row_tiles = this->reg_file[9] & 15; // M / Reuse
     this->b_col_tiles = (this->reg_file[9] >> 4) & 31; // N / NPE
     this->inner_tiles = (this->reg_file[9] >> 9) & 127; // K / VS
@@ -612,8 +639,8 @@ void MXCore::start_next_job() {
     this->result_tile_size = this->reg_file[13];
     this->iter_count = this->reg_file[15] & 0xffff; // (K / elements_per_dotp) * Reuse
 
-    if (ctrl & (7u << 26)) {
-        throw std::invalid_argument("Preload and standalone quantization are not supported");
+    if (ctrl & (3u << 27)) {
+        throw std::invalid_argument("Standalone quantization is not supported");
     }
 
     if (fp4) {
@@ -650,8 +677,9 @@ void MXCore::start_next_job() {
         throw std::invalid_argument("inconsistent programmed tile counts/sizes/iteration count");
     }
 
-    if (!this->pipe_regs && compute_chunks > 1) {
-        throw std::invalid_argument("multi-chunk feedback requires a pipeline register");
+    if (this->preload && (this->reg_file[12] != this->reuse * this->npe * 32 ||
+                          this->npe * 4 < this->bandwidth)) {
+        throw std::invalid_argument("Preload requires an FP32 tile and NPE*32 >= TCDM width");
     }
 
     if (!this->tcdm_itf.is_bound()) {
@@ -674,6 +702,11 @@ void MXCore::start_next_job() {
     this->partial_sum_buffer.assign(this->reuse, std::vector<uint32_t>(this->npe));
     this->partial_sum_valid.assign(this->reuse, false);
     this->partial_sum_final.assign(this->reuse, false);
+    this->preload_buffer.clear();
+    this->preload_reserved = 0;
+    this->preload_row = this->preload_word = this->preload_count = this->preload_final_count = 0;
+    this->preload_wait = this->preload;
+    this->preload_push_ready = false;
 
     for (auto &stage : this->dotp_result_buffer) {
         stage.clear();
@@ -771,14 +804,15 @@ void MXCore::init_mxcore_meta_data() {
     this->iter_scale_b_addr = this->scale_b_addr;
     this->iter_z_addr = this->z_addr;
     this->iter_scale_z_addr = this->scale_z_addr;
-    // set 6 stream all to 0
+    this->iter_preload_addr = this->preload_addr;
     this->stream_issued.fill(0);
     this->fsm_counter = 0;
     this->tcdm_block_total =
         this->get_routine_access_block_number() + this->get_storing_access_block_number();
 
     const uint32_t bases[NB_STREAMS] = {this->a_addr,       this->b_addr, this->scale_a_addr,
-                                        this->scale_b_addr, this->z_addr, this->scale_z_addr};
+                                        this->scale_b_addr, this->z_addr, this->scale_z_addr,
+                                        this->preload_addr};
 
     for (unsigned stream = 0; stream < NB_STREAMS; ++stream) {
         if (uint64_t(bases[stream]) + uint64_t(this->stream_total[stream]) * this->bandwidth >
@@ -809,8 +843,12 @@ uint32_t MXCore::get_routine_access_block_number() {
             ? 1
             : uint64_t(this->scale_b_matrix_bytes) * this->a_row_tiles / this->bandwidth;
 
+    this->stream_total[STREAM_C] =
+        this->preload ? uint64_t(this->reg_file[12]) * this->a_row_tiles * this->b_col_tiles /
+                            (this->bandwidth * 8) : 0;
+
     return this->stream_total[STREAM_A] + this->stream_total[STREAM_B] + this->stream_total[STREAM_SA] +
-           this->stream_total[STREAM_SB];
+           this->stream_total[STREAM_SB] + this->stream_total[STREAM_C];
 }
 
 uint32_t MXCore::get_storing_access_block_number() {
@@ -900,6 +938,17 @@ void MXCore::enqueue_read_requests(const std::array<bool, NB_INPUT_STREAMS> &roo
     }
 }
 
+void MXCore::enqueue_preload_request(bool room) {
+    if (!room || this->stream_done(STREAM_C) || !this->issue_slot_gate_ok(STREAM_C)) {
+        return;
+    }
+    ReqSlot &slot = this->req_slots[this->alloc_req_slot(STREAM_C)];
+    slot.req->set_addr(this->next_addr(STREAM_C));
+    slot.req->set_size(this->bandwidth);
+    slot.req->set_is_write(false);
+    ++this->preload_reserved;
+}
+
 void MXCore::enqueue_write_request(bool z, bool sz) {
     if ((!z && !sz) || !this->issue_slot_gate_ok(STREAM_Z)) {
         return;
@@ -952,19 +1001,22 @@ int MXCore::arbitrate_request() {
     }
 
     int selected = -1;
-    for (unsigned stream = 0; stream < NB_STREAMS; ++stream) {
+    for (unsigned stream : {STREAM_C, STREAM_A, STREAM_B, STREAM_SA, STREAM_SB, STREAM_Z, STREAM_SZ}) {
         for (auto index : this->pending[stream]) {
+            
             const ReqSlot &slot = this->req_slots[index];
             if (slot.state != REQ_QUEUED || slot.available_at > now) {
                 continue;
             }
+
             // i_result_fifo_mux
             if (selected < 0 || slot.available_at < this->req_slots[selected].available_at) {
                 selected = index;
             }
             break;
         }
-        if (selected >= 0 && stream < NB_INPUT_STREAMS) {
+
+        if (selected >= 0 && (stream == STREAM_C || stream < NB_INPUT_STREAMS)) {
             break;
         }
     }
@@ -997,22 +1049,34 @@ void MXCore::process_responses() {
             this->free_req_slot(i);
         }
     }
+
     for (unsigned stream = 0; stream < NB_STREAMS; ++stream) {
         auto &q = this->pending[stream];
         if (q.empty()) {
             continue;
         }
+
         const unsigned slot_id = q.front();
         ReqSlot       &slot = this->req_slots[slot_id];
         if (slot.state != REQ_RETURNED || slot.available_at > now) {
             continue;
         }
+
         if (stream < NB_INPUT_STREAMS) {
             if (!this->input_push_ready[stream]) {
                 continue;
             }
+
             this->process_iter_instruction(slot.buf, stream);
+        } else if (stream == STREAM_C) {
+            if (!this->preload_push_ready) {
+                continue;
+            }
+
+            this->preload_buffer.emplace_back(slot.buf, slot.buf + this->bandwidth);
+            --this->preload_reserved;
         }
+
         this->free_req_slot(slot_id);
         q.pop_front();
     }
@@ -1095,11 +1159,38 @@ void MXCore::retire_result(std::vector<uint32_t> result, uint8_t flags) {
     this->partial_write_row = (row + 1) % this->reuse;
 }
 
+void MXCore::process_preload() {
+    const Bytes &beat = this->preload_buffer.front();
+    auto &row = this->partial_sum_buffer[this->preload_row];
+    const unsigned words = this->bandwidth / 4;
+    for (unsigned i = 0; i < words; ++i) {
+        uint32_t value = 0;
+        for (unsigned byte = 0; byte < 4; ++byte) {
+            value |= uint32_t(beat[i * 4 + byte]) << (8 * byte);
+        }
+        row[this->preload_word * words + i] = value;
+    }
+    this->preload_buffer.pop_front();
+    if (++this->preload_word == this->npe / words) {
+        this->preload_word = 0;
+        this->partial_sum_valid[this->preload_row] = true;
+        this->partial_sum_final[this->preload_row] = false;
+        this->preload_row = (this->preload_row + 1) % this->reuse;
+        ++this->preload_count;
+    }
+}
+
 void MXCore::process_compute() {
     const unsigned result_row = this->result_read_row;
     const bool     drain = this->partial_sum_valid[result_row] && this->partial_sum_final[result_row] &&
                        this->output_can_push(0) && (!this->quantize_mx || this->output_can_push(1));
-    const bool write_ready = !this->partial_sum_valid[this->partial_write_row];
+    const bool write_ready = !this->partial_sum_valid[this->partial_write_row] &&
+                             !(this->preload && this->preload_word &&
+                               this->partial_write_row == this->preload_row);
+    const bool preload_ready = this->preload_count >= this->preload_threshold;
+    const bool preload_fire = this->preload && !this->preload_buffer.empty() &&
+                              (this->preload_count < this->reuse + this->preload_final_count ||
+                               this->preload_word) && !this->partial_sum_valid[this->preload_row];
     
     std::vector<bool> ready(this->pipe_regs);
     for (int i = int(this->pipe_regs) - 1; i >= 0; --i) {
@@ -1111,8 +1202,10 @@ void MXCore::process_compute() {
     const unsigned feedback_row = this->partial_read_row;
     auto          &partial = this->partial_sum_buffer[feedback_row];
     const bool     feedback_ready =
-        first || (this->partial_sum_valid[feedback_row] && !this->partial_sum_final[feedback_row]);
+        (first && !this->preload) ||
+        (this->partial_sum_valid[feedback_row] && !this->partial_sum_final[feedback_row]);
     const bool engine_ready = this->compute_count < this->expected_bundles && feedback_ready &&
+                              (!this->preload || !this->preload_wait) &&
                               (this->pipe_regs ? ready[0] : write_ready);
     
     bool all_valid = true;
@@ -1155,7 +1248,7 @@ void MXCore::process_compute() {
         if (all_valid) {
             compute_valid = true;
             computed_bits.resize(this->npe);
-            const uint32_t *d = first ? nullptr : partial.data();
+            const uint32_t *d = first && !this->preload ? nullptr : partial.data();
 
             if (this->src_fmt == InputFormat::E2M1) {
                 computed_status = matmul_fp4(computed_bits.data(), d, operands[0].data(),
@@ -1170,7 +1263,7 @@ void MXCore::process_compute() {
                                                  operands[1].data(), operands[2].data(), operands[3].data(),
                                                  1, this->vs, this->vs, this->npe, this->reuse, this->dotp);
             }
-            if (!first) {
+            if (!first || this->preload) {
                 this->partial_sum_valid[feedback_row] = false;
                 this->partial_read_row = (this->partial_read_row + 1) % this->reuse;
             }
@@ -1209,6 +1302,25 @@ void MXCore::process_compute() {
         }
     }
 
+    if (preload_fire) {
+        this->process_preload();
+    }
+
+    if (this->preload && preload_ready) {
+        this->preload_wait = false;
+    }
+
+    if (this->preload && retire_valid) {
+        if (this->out_count + this->reuse >= this->iter_count) {
+            ++this->preload_final_count;
+        }
+        if (this->out_count == this->iter_count - 1) {
+            this->preload_count -= this->reuse;
+            this->preload_final_count = 0;
+            this->preload_wait = this->retired_count != this->expected_bundles;
+        }
+    }
+
     const bool last_iteration = this->next_iteration(compute_valid, retire_valid);
     if (compute_valid) {
         this->reg_fsm_state.set(last_iteration ? STORING : ROUTINE);
@@ -1235,7 +1347,8 @@ bool MXCore::finished() const {
                         [](bool v) { return v; }) &&
            std::none_of(this->partial_sum_valid.begin(), this->partial_sum_valid.end(),
                         [](bool v) { return v; }) &&
-           this->result_buffer.empty() && this->result_scale_buffer.empty();
+           this->result_buffer.empty() && this->result_scale_buffer.empty() &&
+           this->preload_buffer.empty() && !this->preload_reserved && !this->preload_word;
 }
 
 void MXCore::check_state() {
@@ -1262,6 +1375,9 @@ void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
         room[i] = _this->input_can_reserve(i);
         _this->input_push_ready[i] = _this->input_can_push(i);
     }
+    const bool preload_room = _this->preload &&
+        _this->preload_buffer.size() + _this->preload_reserved < 2 * STREAM_FIFO_DEPTH;
+    _this->preload_push_ready = _this->preload_buffer.size() < STREAM_FIFO_DEPTH;
     
     const bool final = _this->final_rows == _this->expected_rows;
     const bool z = !_this->stream_done(STREAM_Z) && _this->output_valid(0, final);
@@ -1271,6 +1387,7 @@ void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     _this->process_compute();
     
     _this->enqueue_read_requests(room);
+    _this->enqueue_preload_request(preload_room);
     _this->enqueue_write_request(z, sz);
     const int slot_id = _this->arbitrate_request();
     
@@ -1377,6 +1494,11 @@ uint32_t MXCore::next_addr(unsigned stream) {
         addr = this->iter_scale_z_addr;
         if (more)
             this->iter_scale_z_addr = this->inc_addr(addr, this->bandwidth);
+        break;
+    case STREAM_C:
+        addr = this->iter_preload_addr;
+        if (more)
+            this->iter_preload_addr = this->inc_addr(addr, this->bandwidth);
         break;
     default:
         throw std::logic_error("invalid MXCore stream instruction");

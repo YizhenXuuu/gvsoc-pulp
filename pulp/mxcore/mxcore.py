@@ -18,19 +18,22 @@ class MXCore(gvsoc.systree.Component):
     reuse: int
         Number of rows sharing B inputs and partial-sum storage.
     num_pipe_regs: int
-        Dot-product latency in cycles without stalls.
+        Must be four, matching the fixed pipeline in fpnew_mxdotp_multi_opt.
     tcdm_bank_width: int
         Width of one TCDM bank in bytes.
     tcdm_bank_number: int
         Number of banks in a wide TCDM transfer.
     num_cores: int
         Number of core event destinations (the RTL default is nine).
+    preload_threshold: int
+        Complete FP32 rows required before computing; defaults to reuse/2.
     """
 
     def __init__(self, parent: gvsoc.systree.Component, name: str,
                  vector_size: int=32, npe: int=32, reuse: int=64,
                  num_pipe_regs: int=4, tcdm_bank_width: int=4,
-                 tcdm_bank_number: int=16, num_cores: int=9):
+                 tcdm_bank_number: int=16, num_cores: int=9,
+                 preload_threshold: int=None):
 
         super().__init__(parent, name)
 
@@ -62,11 +65,19 @@ class MXCore(gvsoc.systree.Component):
         if not max(4, vector_size) <= bandwidth <= 512:
             raise ValueError('MXCore TCDM bandwidth must cover one VS vector and be at most 512 bytes')
         
-        if not 0 <= num_pipe_regs <= 64:
-            raise ValueError('MXCore num_pipe_regs must be in [0,64]')
+        if num_pipe_regs != 4:
+            raise ValueError('MXCore num_pipe_regs must be 4 to match fpnew_mxdotp_multi_opt')
         
         if not 1 <= num_cores <= 16:
             raise ValueError('MXCore num_cores must be in [1,16]')
+
+        if preload_threshold is None:
+            preload_threshold = reuse // 2
+        if isinstance(preload_threshold, bool) or not isinstance(preload_threshold, int):
+            raise ValueError('MXCore preload_threshold must be an integer')
+        if not 0 <= preload_threshold <= reuse:
+            raise ValueError('MXCore preload_threshold must be in [0,reuse]')
+        properties['preload_threshold'] = preload_threshold
         
         self.add_properties(properties)
 
