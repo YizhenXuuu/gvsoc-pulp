@@ -17,9 +17,17 @@ class Testbench(gvsoc.systree.Component):
                                         description='MXCore output format').get_value()
         preload = TargetParameter(self, name='preload', value=0,
                                   description='Preload FP32 accumulator from the C region').get_value()
+        standalone = TargetParameter(self, name='standalone', value=0,
+                                     description='Quantize C without matrix multiplication').get_value()
+        standalone_input = TargetParameter(self, name='standalone_input', value='fp32',
+                                           description='Standalone C format: fp32 or bf16').get_value().lower()
         
         if preload not in (0, 1):
             raise ValueError('MXCore preload must be 0 or 1')
+        if standalone not in (0, 1):
+            raise ValueError('MXCore standalone must be 0 or 1')
+        if standalone_input not in ('fp32', 'bf16'):
+            raise ValueError('MXCore standalone_input must be fp32 or bf16')
         
         output_file = TargetParameter(self, name='output_file',
                                       value=str(Path(__file__).resolve().parent / 'output_tb/output.bin'),
@@ -28,6 +36,8 @@ class Testbench(gvsoc.systree.Component):
         self.add_properties(self.get_format_config(input_format, output_format))
         self.add_properties(dict(input_file=binary, input_format=input_format,
                                  output_format=output_format, output_file=output_file, preload=preload,
+                                 standalone=standalone, standalone_input=standalone_input,
+                                 standalone_input_bits=16 if standalone_input == 'bf16' else 32,
                                  m=m, k=k, n=n, vector_size=vs, reuse=reuse, npe=npe))
 
     @staticmethod

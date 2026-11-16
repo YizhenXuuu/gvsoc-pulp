@@ -107,6 +107,8 @@ class MXCore : public vp::Component {
     void    check_state();
     void    process_compute();
     void    process_preload();
+    void    process_standalone();
+    void    push_result_row(const std::vector<uint32_t> &row);
     void    retire_result(std::vector<uint32_t> result, uint8_t flags);
     bool    finished() const;
 
@@ -217,6 +219,8 @@ class MXCore : public vp::Component {
     bool                             quantize_mx = false;
     bool                             block_poison = false;
     bool                             preload = false;
+    bool                             standalone = false;
+    bool                             standalone_input_bf16 = false;
 
     // MXCore meta data
     // Programmed tile counts and tile sizes in bits; checked against M/N/K, VS, NPE and Reuse.
@@ -300,6 +304,13 @@ class MXCore : public vp::Component {
     unsigned                           preload_final_count = 0;
     bool                               preload_wait = false;
     bool                               preload_push_ready = false;
+
+    // Standalone input repacking bypasses the accumulation buffer and MXDOTP.
+    FifoLanes                          standalone_buffer;
+    unsigned                           standalone_push_lane = 0;
+    unsigned                           standalone_slice = 0;
+    uint32_t                           standalone_input_count = 0;
+    bool                               standalone_input_done = false;
 
     struct ReqSlot {
         vp::IoReq       *req;
@@ -451,6 +462,9 @@ void MXCore::clear_engine() {
     this->preload_reserved = 0;
     this->preload_row = this->preload_word = this->preload_count = this->preload_final_count = 0;
     this->preload_wait = this->preload_push_ready = false;
+    this->standalone_buffer.clear();
+    this->standalone_push_lane = this->standalone_slice = this->standalone_input_count = 0;
+    this->standalone_input_done = false;
 
     for (auto &stage : this->dotp_result_buffer) {
         stage.clear();
@@ -607,8 +621,12 @@ void MXCore::start_next_job() {
     this->k_size = (this->reg_file[7] >> 10) & 0xfff;
     this->n_size = (this->reg_file[7] >> 22) & 0x3ff;
     const uint32_t ctrl = this->reg_file[8];
+    this->standalone = (ctrl >> 27) & 1;
+    this->standalone_input_bf16 = this->standalone && ((ctrl >> 28) & 1);
     this->src_fmt = InputFormat((ctrl >> 9) & 15);
-    mxcore::get_input_encoding(this->src_fmt);
+    if (!this->standalone) {
+        mxcore::get_input_encoding(this->src_fmt);
+    }
     const bool fp4 = this->src_fmt == InputFormat::E2M1;
     this->elements_per_dotp = (fp4 ? 2u : 1u) * this->vs;
     this->input_block_size = fp4 ? 64 : 32;
@@ -629,7 +647,7 @@ void MXCore::start_next_job() {
     this->result_bits = mxcore::output_bits(this->output_format);
     this->quantize_mx = mxcore::output_has_scale(this->output_format);
     this->block_poison = (ctrl >> 25) & 1;
-    this->preload = (ctrl >> 26) & 1;
+    this->preload = ((ctrl >> 26) & 1) && !this->standalone;
     this->a_row_tiles = this->reg_file[9] & 15; // M / Reuse
     this->b_col_tiles = (this->reg_file[9] >> 4) & 31; // N / NPE
     this->inner_tiles = (this->reg_file[9] >> 9) & 127; // K / VS
@@ -639,47 +657,54 @@ void MXCore::start_next_job() {
     this->result_tile_size = this->reg_file[13];
     this->iter_count = this->reg_file[15] & 0xffff; // (K / elements_per_dotp) * Reuse
 
-    if (ctrl & (3u << 27)) {
-        throw std::invalid_argument("Standalone quantization is not supported");
-    }
-
-    if (fp4) {
-        if (this->vs != 32) {
-            throw std::invalid_argument("gwaihir FP4 input requires hardware VS=32");
-        }
+    if (fp4 && !this->standalone && this->vs != 32) {
+        throw std::invalid_argument("gwaihir FP4 input requires hardware VS=32");
     }
 
     const unsigned op = (ctrl >> 3) & 31;
     // Existing numerical contract: RNE, floating MXDOTP, FP32 accumulation.
     // SDOTP=19 is the workspace testbench encoding; MXDOTPF=22 is accepted too.
-    if ((ctrl & 7) || ((ctrl >> 13) & 15) || (op != 19 && op != 22) || (ctrl & (1u << 20))) {
+    if (!this->standalone &&
+        ((ctrl & 7) || ((ctrl >> 13) & 15) || (op != 19 && op != 22) || (ctrl & (1u << 20)))) {
         throw std::invalid_argument("requires RNE, SDOTP/MXDOTPF, FP32 destination and flush=0");
     }
 
-    if (!this->m_size || !this->n_size || !this->k_size || this->m_size % this->reuse ||
-        this->n_size % this->npe || this->k_size % this->elements_per_dotp ||
-        this->k_size % this->input_block_size ||
-        this->k_size / this->elements_per_dotp * uint64_t(this->reuse) > 65535) {
+    if (!this->m_size || !this->n_size || this->m_size % this->reuse || this->n_size % this->npe) {
+        throw std::invalid_argument("requires full Reuse/NPE tiles");
+    }
+
+    if (!this->standalone &&
+        (!this->k_size || this->k_size % this->elements_per_dotp ||
+         this->k_size % this->input_block_size ||
+         this->k_size / this->elements_per_dotp * uint64_t(this->reuse) > 65535)) {
         throw std::invalid_argument("requires full Reuse/NPE tiles and complete input vectors/scale blocks");
     }
 
     const unsigned input_bits = fp4 ? 4u : 8u;
-    const unsigned compute_chunks = this->k_size / this->elements_per_dotp;
+    const unsigned compute_chunks = this->standalone ? 0 : this->k_size / this->elements_per_dotp;
     if (this->a_row_tiles != this->m_size / this->reuse || this->b_col_tiles != this->n_size / this->npe ||
-        this->inner_tiles != this->k_size / this->vs ||
-        this->inner_blocks != this->k_size / this->input_block_size ||
-        this->a_tile_size != this->reuse * this->vs * input_bits ||
-        this->b_tile_size != this->npe * this->vs * input_bits ||
         this->result_tile_size != this->reuse * this->npe * this->result_bits ||
-        (this->quantize_mx && this->reg_file[14] != this->reuse * (this->npe / 32) * 8) ||
-        this->iter_count != compute_chunks * this->reuse ||
-        ((this->reg_file[9] >> 23) & 63) != std::min(32u / this->vs, compute_chunks)) {
-        throw std::invalid_argument("inconsistent programmed tile counts/sizes/iteration count");
+        (this->quantize_mx && this->reg_file[14] != this->reuse * (this->npe / 32) * 8)) {
+        throw std::invalid_argument("inconsistent programmed output tile counts/sizes");
     }
 
-    if (this->preload && (this->reg_file[12] != this->reuse * this->npe * 32 ||
-                          this->npe * 4 < this->bandwidth)) {
-        throw std::invalid_argument("Preload requires an FP32 tile and NPE*32 >= TCDM width");
+    if (!this->standalone &&
+        (this->inner_tiles != this->k_size / this->vs ||
+         this->inner_blocks != this->k_size / this->input_block_size ||
+         this->a_tile_size != this->reuse * this->vs * input_bits ||
+         this->b_tile_size != this->npe * this->vs * input_bits ||
+         this->iter_count != compute_chunks * this->reuse ||
+         ((this->reg_file[9] >> 23) & 63) != std::min(32u / this->vs, compute_chunks))) {
+        throw std::invalid_argument("inconsistent programmed GEMM tile sizes/iteration count");
+    }
+
+    const unsigned c_bits = this->standalone_input_bf16 ? 16 : 32;
+    if ((this->preload || this->standalone) &&
+        this->reg_file[12] != this->reuse * this->npe * c_bits) {
+        throw std::invalid_argument("inconsistent programmed C input tile size");
+    }
+    if (this->preload && this->npe * 4 < this->bandwidth) {
+        throw std::invalid_argument("Preload requires NPE*32 >= TCDM width");
     }
 
     if (!this->tcdm_itf.is_bound()) {
@@ -699,14 +724,22 @@ void MXCore::start_next_job() {
     this->fence = {};
     this->init_input_buffers();
     this->init_output_buffers();
-    this->partial_sum_buffer.assign(this->reuse, std::vector<uint32_t>(this->npe));
-    this->partial_sum_valid.assign(this->reuse, false);
-    this->partial_sum_final.assign(this->reuse, false);
+    this->partial_sum_buffer.assign(this->standalone ? 0 : this->reuse,
+                                    std::vector<uint32_t>(this->npe));
+    this->partial_sum_valid.assign(this->standalone ? 0 : this->reuse, false);
+    this->partial_sum_final.assign(this->standalone ? 0 : this->reuse, false);
     this->preload_buffer.clear();
     this->preload_reserved = 0;
     this->preload_row = this->preload_word = this->preload_count = this->preload_final_count = 0;
     this->preload_wait = this->preload;
     this->preload_push_ready = false;
+    this->standalone_push_lane = this->standalone_slice = this->standalone_input_count = 0;
+    this->standalone_input_done = false;
+    this->standalone_buffer.clear();
+    const unsigned standalone_row_bytes = this->npe * c_bits / 8;
+    if (this->standalone && !(this->standalone_input_bf16 && standalone_row_bytes == this->bandwidth)) {
+        this->standalone_buffer.assign(std::max(1u, standalone_row_bytes / this->bandwidth), {});
+    }
 
     for (auto &stage : this->dotp_result_buffer) {
         stage.clear();
@@ -720,9 +753,10 @@ void MXCore::start_next_job() {
     this->reg_fsm_state.set(PRELOAD);
     this->reg_busy.set(1);
     this->trace.msg(vp::TraceLevel::DEBUG,
-                    "MXCore start: M=%u K=%u N=%u VS=%u NPE=%u Reuse=%u BW=%uB/cycle pipe=%u\n", this->m_size,
+                    "MXCore start: M=%u K=%u N=%u VS=%u NPE=%u Reuse=%u BW=%uB/cycle "
+                    "pipe=%u standalone=%u C=%u-bit\n", this->m_size,
                     this->k_size, this->n_size, this->vs, this->npe, this->reuse, this->bandwidth,
-                    this->pipe_regs);
+                    this->pipe_regs, unsigned(this->standalone), c_bits);
     this->check_state();
 }
 
@@ -771,19 +805,21 @@ void MXCore::init_mxcore_meta_data() {
     const uint64_t satile = this->reuse * 8, sarow = satile * kb, samat = sarow * ar,
                    sbmat = this->npe * 8 * kb * bc;
 
-    if (arow % bw || bmat % bw || z_tile * ar * bc % bw || (sbmat >= bw && sbmat % bw)) {
+    if (z_tile * ar * bc % bw ||
+        ((this->preload || this->standalone) && uint64_t(this->reg_file[12]) * ar * bc % bw) ||
+        (!this->standalone && (arow % bw || bmat % bw || (sbmat >= bw && sbmat % bw)))) {
         throw std::invalid_argument("Job requires integral RTL stream beats");
     }
 
-    if (satile > bw && ar != 1) {
+    if (!this->standalone && satile > bw && ar != 1) {
         throw std::invalid_argument("RTL large ScaleA branch supports one row tile");
     }
 
-    if (satile <= bw && sarow % bw && (bc > 1 || samat > bw)) {
+    if (!this->standalone && satile <= bw && sarow % bw && (bc > 1 || samat > bw)) {
         throw std::invalid_argument("RTL ScaleA row-tile replay requires integral beats");
     }
 
-    if (sbmat < bw && kb * bc * ar != 1) {
+    if (!this->standalone && sbmat < bw && kb * bc * ar != 1) {
         throw std::invalid_argument("RTL short ScaleB buffer cannot replay additional groups");
     }
 
@@ -805,6 +841,7 @@ void MXCore::init_mxcore_meta_data() {
     this->iter_z_addr = this->z_addr;
     this->iter_scale_z_addr = this->scale_z_addr;
     this->iter_preload_addr = this->preload_addr;
+    this->stream_total.fill(0);
     this->stream_issued.fill(0);
     this->fsm_counter = 0;
     this->tcdm_block_total =
@@ -823,6 +860,16 @@ void MXCore::init_mxcore_meta_data() {
 }
 
 uint32_t MXCore::get_routine_access_block_number() {
+    this->stream_total[STREAM_C] =
+        (this->preload || this->standalone)
+            ? uint64_t(this->reg_file[12]) * this->a_row_tiles * this->b_col_tiles /
+                  (this->bandwidth * 8)
+            : 0;
+    if (this->standalone) {
+        // The four GEMM sources never start in standalone mode.
+        return this->stream_total[STREAM_C];
+    }
+
     this->stream_total[STREAM_A] =
         uint64_t(this->a_row_tile_bytes) * this->a_row_tiles * this->b_col_tiles / this->bandwidth;
     this->stream_total[STREAM_B] = uint64_t(this->b_matrix_bytes) * this->a_row_tiles / this->bandwidth;
@@ -842,10 +889,6 @@ uint32_t MXCore::get_routine_access_block_number() {
         this->scale_b_matrix_bytes < this->bandwidth
             ? 1
             : uint64_t(this->scale_b_matrix_bytes) * this->a_row_tiles / this->bandwidth;
-
-    this->stream_total[STREAM_C] =
-        this->preload ? uint64_t(this->reg_file[12]) * this->a_row_tiles * this->b_col_tiles /
-                            (this->bandwidth * 8) : 0;
 
     return this->stream_total[STREAM_A] + this->stream_total[STREAM_B] + this->stream_total[STREAM_SA] +
            this->stream_total[STREAM_SB] + this->stream_total[STREAM_C];
@@ -1086,9 +1129,8 @@ void MXCore::process_responses() {
  *                   Compute Engine and FSM                   *
  ************************************************************/
 
-void MXCore::process_iter_instruction() {
-    const auto &last = this->partial_sum_buffer[this->result_read_row];
-    Bytes       values, scales;
+void MXCore::push_result_row(const std::vector<uint32_t> &last) {
+    Bytes values, scales;
 
     if (this->quantize_mx) {
         for (unsigned group = 0; group < this->npe; group += 32) {
@@ -1112,10 +1154,14 @@ void MXCore::process_iter_instruction() {
     }
 
     this->output_push(0, std::move(values));
+    ++this->final_rows;
+}
+
+void MXCore::process_iter_instruction() {
+    this->push_result_row(this->partial_sum_buffer[this->result_read_row]);
     this->partial_sum_valid[this->result_read_row] = false;
     this->partial_sum_final[this->result_read_row] = false;
     this->result_read_row = (this->result_read_row + 1) % this->reuse;
-    ++this->final_rows;
 }
 
 unsigned MXCore::process_iter_instruction(uint8_t *buf, unsigned instr) {
@@ -1177,6 +1223,73 @@ void MXCore::process_preload() {
         this->partial_sum_final[this->preload_row] = false;
         this->preload_row = (this->preload_row + 1) % this->reuse;
         ++this->preload_count;
+    }
+}
+
+void MXCore::process_standalone() {
+    if (!this->standalone_input_done &&
+        this->standalone_input_count == this->stream_total[STREAM_C]) {
+        this->standalone_input_done = true;
+        this->reg_fsm_state.set(STORING);
+        if (this->events[this->offloading_core][0].is_bound()) {
+            this->events[this->offloading_core][0].sync(true);
+        }
+        this->event_pending = true;
+    }
+
+    const unsigned input_bytes = this->standalone_input_bf16 ? 2 : 4;
+    const unsigned row_bytes = this->npe * input_bytes;
+    // The RTL directly connects a BF16 beat when widening it produces one row.
+    const bool direct = this->standalone_input_bf16 && row_bytes == this->bandwidth;
+    const bool push = !direct && !this->preload_buffer.empty() &&
+                      this->standalone_buffer[this->standalone_push_lane].size() < STREAM_FIFO_DEPTH;
+    const bool valid =
+        direct ? !this->preload_buffer.empty()
+               : std::all_of(this->standalone_buffer.begin(), this->standalone_buffer.end(),
+                             [](const std::deque<Bytes> &lane) { return !lane.empty(); });
+    const bool row_fire = valid && this->final_rows < this->expected_rows && this->output_can_push(0) &&
+                          (!this->quantize_mx || this->output_can_push(1));
+
+    if (row_fire) {
+        std::vector<uint32_t> row(this->npe);
+        for (unsigned i = 0; i < this->npe; ++i) {
+            const unsigned offset = this->standalone_slice * row_bytes + i * input_bytes;
+            const unsigned lane = offset / this->bandwidth;
+            const Bytes &beat = direct ? this->preload_buffer.front()
+                                       : this->standalone_buffer[lane].front();
+            uint32_t value = 0;
+            for (unsigned byte = 0; byte < input_bytes; ++byte) {
+                value |= uint32_t(beat[offset % this->bandwidth + byte]) << (8 * byte);
+            }
+            // BF16 widening is a bit concatenation, including NaN payloads.
+            row[i] = this->standalone_input_bf16 ? value << 16 : value;
+        }
+        this->push_result_row(row);
+
+        if (direct) {
+            this->preload_buffer.pop_front();
+            ++this->standalone_input_count;
+        } else if (row_bytes >= this->bandwidth) {
+            for (auto &lane : this->standalone_buffer) {
+                lane.pop_front();
+            }
+        } else if (++this->standalone_slice == this->bandwidth / row_bytes) {
+            this->standalone_slice = 0;
+            this->standalone_buffer.front().pop_front();
+        }
+    }
+
+    // Readiness was sampled before popping, as for the RTL FIFO lane array.
+    if (push) {
+        this->standalone_buffer[this->standalone_push_lane].push_back(
+            std::move(this->preload_buffer.front()));
+        this->preload_buffer.pop_front();
+        this->standalone_push_lane =
+            (this->standalone_push_lane + 1) % this->standalone_buffer.size();
+        ++this->standalone_input_count;
+    }
+    if ((push || row_fire) && !this->standalone_input_done) {
+        this->reg_fsm_state.set(ROUTINE);
     }
 }
 
@@ -1348,7 +1461,11 @@ bool MXCore::finished() const {
            std::none_of(this->partial_sum_valid.begin(), this->partial_sum_valid.end(),
                         [](bool v) { return v; }) &&
            this->result_buffer.empty() && this->result_scale_buffer.empty() &&
-           this->preload_buffer.empty() && !this->preload_reserved && !this->preload_word;
+           this->preload_buffer.empty() && !this->preload_reserved && !this->preload_word &&
+           (!this->standalone ||
+            (this->standalone_input_done && !this->standalone_slice &&
+             std::all_of(this->standalone_buffer.begin(), this->standalone_buffer.end(),
+                         [](const std::deque<Bytes> &lane) { return lane.empty(); })));
 }
 
 void MXCore::check_state() {
@@ -1375,7 +1492,7 @@ void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
         room[i] = _this->input_can_reserve(i);
         _this->input_push_ready[i] = _this->input_can_push(i);
     }
-    const bool preload_room = _this->preload &&
+    const bool preload_room = (_this->preload || _this->standalone) &&
         _this->preload_buffer.size() + _this->preload_reserved < 2 * STREAM_FIFO_DEPTH;
     _this->preload_push_ready = _this->preload_buffer.size() < STREAM_FIFO_DEPTH;
     
@@ -1383,8 +1500,12 @@ void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     const bool z = !_this->stream_done(STREAM_Z) && _this->output_valid(0, final);
     const bool sz = !_this->stream_done(STREAM_SZ) && _this->output_valid(1, final);
     
-    // i_engine
-    _this->process_compute();
+    // Standalone selects the quantizer input without running i_engine.
+    if (_this->standalone) {
+        _this->process_standalone();
+    } else {
+        _this->process_compute();
+    }
     
     _this->enqueue_read_requests(room);
     _this->enqueue_preload_request(preload_room);

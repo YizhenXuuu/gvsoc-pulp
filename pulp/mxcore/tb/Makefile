@@ -4,6 +4,8 @@ binary ?= input.bin
 input ?= fp8
 output ?= fp32
 preload ?= 0
+standalone ?= 0
+standalone_input ?= fp32
 m ?= 64
 k ?= 64
 n ?= 32
@@ -33,6 +35,8 @@ run: gvsoc
 		--parameter="soc/testbench/input=$(input)" \
 		--parameter="soc/testbench/output=$(output)" \
 		--parameter="soc/testbench/preload=$(preload)" \
+		--parameter="soc/testbench/standalone=$(standalone)" \
+		--parameter="soc/testbench/standalone_input=$(standalone_input)" \
 		--parameter="soc/testbench/output_file=$(OUTPUT_DIR)/output.bin" run $(runner_args)
 
 clean:

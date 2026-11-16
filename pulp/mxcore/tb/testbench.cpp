@@ -19,6 +19,8 @@ public:
         output_format = get_js_config()->get_child_str("output_format");
         output_file = get_js_config()->get_child_str("output_file");
         preload = get_js_config()->get_child_int("preload");
+        standalone = get_js_config()->get_child_int("standalone");
+        standalone_input_bits = get_js_config()->get_child_int("standalone_input_bits");
         M = get_js_config()->get_child_int("m");
         K = get_js_config()->get_child_int("k");
         N = get_js_config()->get_child_int("n");
@@ -39,21 +41,25 @@ public:
         const unsigned compute_chunks = K / elements_per_dotp;
         const unsigned reuse_d_reg_size = std::min(32u / VS, compute_chunks);
         result_bits = get_js_config()->get_child_int("result_bits");
-        b_base = ABase + M * K * input_bits / 8;
-        scale_a_base = b_base + K * N * input_bits / 8;
-        scale_b_base = scale_a_base + M * (K / input_block);
-        result_base = scale_b_base + N * (K / input_block);
+        b_base = standalone ? ABase : ABase + M * K * input_bits / 8;
+        scale_a_base = standalone ? ABase : b_base + K * N * input_bits / 8;
+        scale_b_base = standalone ? ABase : scale_a_base + M * (K / input_block);
+        result_base = standalone ? ABase : scale_b_base + N * (K / input_block);
         scale_bytes = result_bits <= 8 ? M * N / 32 : 0;
         result_bytes = M * N * result_bits / 8;
-        scale_base = result_base + (preload ? M * N * 4 : result_bytes);
-        memory.resize(scale_base + scale_bytes + Bandwidth);
+        c_input_bytes = standalone ? M * N * standalone_input_bits / 8 : preload ? M * N * 4 : 0;
+        scale_base = result_base + ((preload || standalone) ? c_input_bytes : result_bytes);
+        memory.resize(std::max(scale_base + scale_bytes, result_base + result_bytes) + Bandwidth);
 
         registers = {ABase, b_base, scale_a_base, scale_b_base, result_base, result_base, scale_base,
                      (N << 22) | (K << 10) | M,
-                     input_control | (19u << 3) | output_control | (uint32_t(preload) << 26),
+                     input_control | (19u << 3) | output_control | (uint32_t(preload) << 26) |
+                         (uint32_t(standalone) << 27) |
+                         (uint32_t(standalone && standalone_input_bits == 16) << 28),
                      ((reuse_d_reg_size & 63u) << 23) | ((inner_blocks & 127u) << 16) |
                          ((inner_tiles & 127u) << 9) | ((b_col_tiles & 31u) << 4) | (a_row_tiles & 15u),
-                     Reuse * VS * input_bits, NPE * VS * input_bits, Reuse * NPE * 32,
+                     Reuse * VS * input_bits, NPE * VS * input_bits,
+                     Reuse * NPE * (standalone ? standalone_input_bits : 32),
                      Reuse * NPE * result_bits, Reuse * (NPE / 32) * 8, Reuse * compute_chunks};
 
         memory_port.set_req_meth(access);
@@ -86,6 +92,9 @@ private:
     vp::ClockEvent timer;
     bool started = false;
     bool preload = false;
+    bool standalone = false;
+    unsigned standalone_input_bits = 32;
+    unsigned c_input_bytes = 0;
     std::array<uint32_t, 16> registers{};
     std::vector<uint8_t> memory;
     unsigned b_base, scale_a_base, scale_b_base, result_base;
@@ -98,7 +107,9 @@ private:
         if (!input) throw std::runtime_error("Cannot open input binary: " + input_file);
         const std::streamsize bytes = input.tellg();
         if (bytes < 0) throw std::runtime_error("Cannot determine input binary size: " + input_file);
-        if (preload && bytes < std::streamsize(result_base) + M * N * 4)
+        if (standalone && bytes < std::streamsize(result_base) + c_input_bytes)
+            throw std::runtime_error("Standalone binary must contain the complete FP32/BF16 C matrix");
+        if (!standalone && preload && bytes < std::streamsize(result_base) + c_input_bytes)
             throw std::runtime_error("Preload binary must contain A, B, ScaleA, ScaleB and FP32 C");
         if (std::size_t(bytes) > memory.size()) memory.resize(bytes, 0xa5);
         input.seekg(0);
@@ -127,7 +138,9 @@ private:
             std::cout << "[TB] Input=" << self.input_file << ", format=" << self.input_format
                       << ", M=" << self.M << " K=" << self.K << " N=" << self.N
                       << ", VS=" << self.VS << " Reuse=" << self.Reuse << " NPE=" << self.NPE
-                      << ", output=" << self.output_format << ", preload=" << self.preload << '\n';
+                      << ", output=" << self.output_format << ", preload=" << self.preload
+                      << ", standalone=" << self.standalone
+                      << ", standalone_input_bits=" << self.standalone_input_bits << '\n';
 
             self.peripheral(0x14, true, 0);
 
