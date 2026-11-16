@@ -276,7 +276,7 @@ class MXCore : public vp::Component {
     std::array<unsigned, NB_OUTPUT_STREAMS> output_row_bytes{};
     std::array<unsigned, NB_OUTPUT_STREAMS> output_lanes{};
     std::array<unsigned, NB_OUTPUT_STREAMS> output_slice{};
-    bool                                    prefer_scale = false;
+    bool                                    result_rr_counter = false;
 
     // MXCore buffers
     FifoLanes                           a_buffer;
@@ -324,6 +324,7 @@ class MXCore : public vp::Component {
 
     std::vector<ReqSlot> req_slots;
     std::array<std::deque<unsigned>, NB_STREAMS> pending;
+    std::deque<unsigned> output_requests; // Shared result request FIFO, in mux acceptance order.
     int      denied_req_slot = -1; // Denied request awaiting grant; -1 means none.
     uint64_t epoch = 0;
 };
@@ -441,6 +442,8 @@ void MXCore::clear_engine() {
     for (auto &q : this->pending) {
         q.clear();
     }
+    this->output_requests.clear();
+    this->result_rr_counter = false;
 
     for (unsigned i = 0; i < this->req_slots.size(); ++i) {
         if (this->req_slots[i].state != REQ_PENDING) {
@@ -749,7 +752,8 @@ void MXCore::start_next_job() {
     std::fill(this->dotp_result_status.begin(), this->dotp_result_status.end(), 0);
     this->timer_start = this->time.get_time();
     this->cycle_start = this->clock.get_cycles();
-    this->prefer_scale = false;
+    this->result_rr_counter = false;
+    this->output_requests.clear();
     this->reg_fsm_state.set(PRELOAD);
     this->reg_busy.set(1);
     this->trace.msg(vp::TraceLevel::DEBUG,
@@ -996,13 +1000,20 @@ void MXCore::enqueue_write_request(bool z, bool sz) {
     if ((!z && !sz) || !this->issue_slot_gate_ok(STREAM_Z)) {
         return;
     }
-    const unsigned i = z && (!sz || !this->prefer_scale) ? STREAM_Z : STREAM_SZ;
-    ReqSlot       &slot = this->req_slots[this->alloc_req_slot(i)];
+    // hci_core_mux_dynamic's winner loop keeps the last requesting entry.
+    // With rr_counter=0, simultaneous Z/SZ requests select SZ first.
+    const unsigned i = z && (!sz || this->result_rr_counter) ? STREAM_Z : STREAM_SZ;
+    const unsigned slot_id = this->alloc_req_slot(i);
+    ReqSlot       &slot = this->req_slots[slot_id];
     const unsigned size = this->process_iter_instruction(slot.buf, i);
     slot.req->set_addr(this->next_addr(i));
     slot.req->set_size(size);
     slot.req->set_is_write(true);
-    this->prefer_scale = i == STREAM_Z;
+    this->output_requests.push_back(slot_id);
+    // Rotate only when a competing request loses an accepted FIFO push.
+    if (z && sz) {
+        this->result_rr_counter = !this->result_rr_counter;
+    }
 }
 
 void MXCore::handle_response(unsigned slot_id, int64_t response_cycle) {
@@ -1033,6 +1044,9 @@ void MXCore::tcdm_grant(vp::Block *__this, vp::IoReq *req) {
     MXCore *_this = static_cast<MXCore *>(__this);
     if (_this->denied_req_slot >= 0 && _this->req_slots[_this->denied_req_slot].req == req) {
         _this->denied_req_slot = -1;
+        // A delayed grant occupies this cycle's wide port, even if the FSM
+        // executes later in the same cycle.
+        _this->next_bus_cycle = std::max(_this->next_bus_cycle, _this->clock.get_cycles() + 1);
     }
     _this->check_state(); // Ownership stays with memory; a grant never resubmits the request.
 }
@@ -1043,8 +1057,7 @@ int MXCore::arbitrate_request() {
         return -1;
     }
 
-    int selected = -1;
-    for (unsigned stream : {STREAM_C, STREAM_A, STREAM_B, STREAM_SA, STREAM_SB, STREAM_Z, STREAM_SZ}) {
+    for (unsigned stream : {STREAM_C, STREAM_A, STREAM_B, STREAM_SA, STREAM_SB}) {
         for (auto index : this->pending[stream]) {
             
             const ReqSlot &slot = this->req_slots[index];
@@ -1052,23 +1065,29 @@ int MXCore::arbitrate_request() {
                 continue;
             }
 
-            // i_result_fifo_mux
-            if (selected < 0 || slot.available_at < this->req_slots[selected].available_at) {
-                selected = index;
-            }
-            break;
-        }
-
-        if (selected >= 0 && (stream == STREAM_C || stream < NB_INPUT_STREAMS)) {
-            break;
+            return index;
         }
     }
-    return selected;
+
+    if (!this->output_requests.empty()) {
+        const unsigned index = this->output_requests.front();
+        const ReqSlot &slot = this->req_slots[index];
+        if (slot.state == REQ_QUEUED && slot.available_at <= now) {
+            return index;
+        }
+    }
+    return -1;
 }
 
 void MXCore::issue_request(unsigned slot_id) {
     const auto now = this->clock.get_cycles();
     ReqSlot   &slot = this->req_slots[slot_id];
+    if (slot.stream == STREAM_Z || slot.stream == STREAM_SZ) {
+        if (this->output_requests.empty() || this->output_requests.front() != slot_id) {
+            throw std::logic_error("MXCore result request FIFO order mismatch");
+        }
+        this->output_requests.pop_front();
+    }
     slot.state = REQ_PENDING;
     slot.issued_at = now;
     ++this->fsm_counter;

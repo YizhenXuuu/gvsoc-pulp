@@ -1,19 +1,26 @@
 #include <vp/vp.hpp>
 #include <vp/itf/io.hpp>
 #include <vp/itf/wire.hpp>
+#include "tb_tcdm_memory.hpp"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 class MXCoreTestbench : public vp::Component {
 public:
     explicit MXCoreTestbench(vp::ComponentConf &conf)
-        : vp::Component(conf), timer(this, step), watchdog(this, timed_out) {
+        : vp::Component(conf), timer(this, step), watchdog(this, timed_out),
+          memory_event(this, memory_step) {
         input_file = get_js_config()->get_child_str("input_file");
         input_format = get_js_config()->get_child_str("input_format");
         output_format = get_js_config()->get_child_str("output_format");
@@ -21,6 +28,13 @@ public:
         preload = get_js_config()->get_child_int("preload");
         standalone = get_js_config()->get_child_int("standalone");
         standalone_input_bits = get_js_config()->get_child_int("standalone_input_bits");
+        no_stalls = get_js_config()->get_child_int("no_stalls");
+        stall_probability = get_js_config()->get("stall_probability")->get_double();
+        const int seed = get_js_config()->get_child_int("stall_seed");
+        if (!std::isfinite(stall_probability) || stall_probability < 0 || stall_probability > 1 || seed < 0)
+            throw std::invalid_argument("Invalid MXCore memory stall probability/seed");
+        stall_seed = unsigned(seed);
+        load_grants(get_js_config()->get_child_str("grant_file"));
         M = get_js_config()->get_child_int("m");
         K = get_js_config()->get_child_int("k");
         N = get_js_config()->get_child_int("n");
@@ -82,6 +96,8 @@ public:
             // An asynchronous target still owns its request until response.
             discard_mmio = mmio_state == MmioState::PENDING;
             if (!discard_mmio) mmio_state = MmioState::IDLE;
+            // Release pre-reset transactions asynchronously without modifying reloaded data.
+            for (auto &transfer : memory_requests) transfer.cancelled = true;
             std::fill(memory.begin(), memory.end(), 0xa5);
             load_input();
         } else {
@@ -95,7 +111,7 @@ private:
     enum class MmioState { IDLE, PENDING, RETURNED };
 
     unsigned M, K, N, VS, NPE, Reuse;
-    static constexpr unsigned Bandwidth = 64;
+    static constexpr unsigned Bandwidth = mxcore::tb::BeatBytes;
     static constexpr unsigned ABase = 0;
     static constexpr int64_t TimeoutCycles = 1000000;
 
@@ -104,6 +120,7 @@ private:
     vp::WireSlave<bool> completion;
     vp::ClockEvent timer;
     vp::ClockEvent watchdog;
+    vp::ClockEvent memory_event;
     Phase phase = Phase::START;
     MmioState mmio_state = MmioState::IDLE;
     std::array<uint8_t, 4> mmio_data{};
@@ -113,6 +130,24 @@ private:
     bool reset_active = true;
     bool discard_mmio = false;
     bool completion_seen = false;
+    bool no_stalls = false;
+    double stall_probability = 0.1;
+    unsigned stall_seed = 1;
+    bool replay_grants = false;
+    std::map<int64_t, uint32_t> grant_schedule;
+    int64_t last_memory_attempt = -1;
+
+    struct MemoryRequest {
+        vp::IoReq *request;
+        mxcore::tb::MemoryBeat beat;
+        bool cancelled = false;
+    };
+    struct MemoryResponse {
+        MemoryRequest transfer;
+        int64_t ready_at;
+    };
+    std::deque<MemoryRequest> memory_requests;
+    std::deque<MemoryResponse> memory_responses;
     bool preload = false;
     bool standalone = false;
     unsigned standalone_input_bits = 32;
@@ -137,6 +172,43 @@ private:
         input.seekg(0);
         input.read(reinterpret_cast<char *>(memory.data() + ABase), bytes);
         if (!input) throw std::runtime_error("Cannot read input binary: " + input_file);
+    }
+
+    void load_grants(const std::string &path) {
+        replay_grants = !path.empty();
+        if (!replay_grants) return;
+        std::ifstream input(path);
+        if (!input) throw std::runtime_error("Cannot open MXCore grant file: " + path);
+        std::string line;
+        unsigned line_number = 0;
+        while (std::getline(input, line)) {
+            ++line_number;
+            const auto comment = line.find('#');
+            if (comment != std::string::npos) line.resize(comment);
+            std::istringstream fields(line);
+            fields >> std::ws;
+            if (fields.eof()) continue;
+            int64_t cycle;
+            std::string mask, extra;
+            if (!(fields >> cycle >> mask) || cycle < 0 || (fields >> extra))
+                throw std::runtime_error("Invalid MXCore grant file line " + std::to_string(line_number));
+            std::size_t end;
+            const unsigned long grants = std::stoul(mask, &end, 16);
+            if (end != mask.size() || grants > mxcore::tb::AllBankGrants ||
+                !grant_schedule.emplace(cycle, uint32_t(grants)).second)
+                throw std::runtime_error("Invalid/duplicate MXCore grant mask on line " +
+                                         std::to_string(line_number));
+        }
+        if (!input.eof()) throw std::runtime_error("Cannot read MXCore grant file: " + path);
+    }
+
+    uint32_t bank_grants(int64_t cycle) const {
+        if (no_stalls) return mxcore::tb::AllBankGrants;
+        if (replay_grants) {
+            const auto entry = grant_schedule.find(cycle);
+            return entry == grant_schedule.end() ? mxcore::tb::AllBankGrants : entry->second;
+        }
+        return mxcore::tb::sample_bank_grants(uint64_t(cycle), stall_probability, stall_seed);
     }
 
     void peripheral(unsigned address, bool write, uint32_t value = 0) {
@@ -292,15 +364,49 @@ private:
 
     static vp::IoReqStatus access(vp::Block *block, vp::IoReq *request) {
         auto &self = *static_cast<MXCoreTestbench *>(block);
-        const auto address = request->get_addr(), size = request->get_size();
-        if (!size || address > self.memory.size() || size > self.memory.size() - address)
+        mxcore::tb::MemoryBeat beat;
+        beat.address = request->get_addr();
+        const uint64_t size = request->get_size();
+        if (!size || size > Bandwidth || !request->get_data()) return vp::IO_REQ_INVALID;
+        beat.size = unsigned(size);
+        beat.write = request->get_is_write();
+        if (!beat.valid(self.memory.size()))
             return vp::IO_REQ_INVALID;
-        if (request->get_is_write())
-            std::memcpy(self.memory.data() + address, request->get_data(), size);
-        else
-            std::memcpy(request->get_data(), self.memory.data() + address, size);
-        request->inc_latency(1);
-        return vp::IO_REQ_OK;
+        if (beat.write) std::copy_n(request->get_data(), beat.size, beat.data.begin());
+        self.memory_requests.push_back({request, std::move(beat)});
+        if (!self.memory_event.is_enqueued()) self.memory_event.enqueue(0);
+        // Bank acceptance happens in memory_step, after the issuing callback.
+        // Retain the original request and later deliver grant, then response.
+        return vp::IO_REQ_DENIED;
+    }
+
+    static void memory_step(vp::Block *block, vp::ClockEvent *) {
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        const int64_t now = self.clock.get_cycles();
+
+        while (!self.memory_responses.empty() && self.memory_responses.front().ready_at <= now) {
+            auto response = std::move(self.memory_responses.front());
+            self.memory_responses.pop_front();
+            auto &transfer = response.transfer;
+            if (!transfer.beat.write)
+                std::copy_n(transfer.beat.data.begin(), transfer.beat.size, transfer.request->get_data());
+            transfer.request->status = vp::IO_REQ_OK;
+            transfer.request->get_resp_port()->resp(transfer.request);
+        }
+
+        if (!self.memory_requests.empty() && self.last_memory_attempt != now) {
+            self.last_memory_attempt = now;
+            auto &transfer = self.memory_requests.front();
+            const bool granted = transfer.cancelled || transfer.beat.accept(self.memory, self.bank_grants(now));
+            if (granted) {
+                vp::IoReq *request = transfer.request;
+                self.memory_responses.push_back({std::move(transfer), now + 1});
+                self.memory_requests.pop_front();
+                // Grants are ANDed within one cycle, never accumulated across cycles.
+                request->get_resp_port()->grant(request);
+            }
+        }
+        if (!self.memory_requests.empty() || !self.memory_responses.empty()) self.memory_event.enqueue(1);
     }
 
     void save_output() const {

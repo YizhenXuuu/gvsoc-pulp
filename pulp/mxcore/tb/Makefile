@@ -6,6 +6,12 @@ output ?= fp32
 preload ?= 0
 standalone ?= 0
 standalone_input ?= fp32
+no_stalls ?= 0
+stall_probability ?= 0.1
+stall_seed ?= 1
+# Optional sparse replay: decimal absolute clock cycle, hex 16-bit grant mask.
+# Bit i grants port i; omitted cycles grant all ports. no_stalls=1 overrides replay.
+grant_file ?=
 m ?= 64
 k ?= 64
 n ?= 32
@@ -37,6 +43,10 @@ run: gvsoc
 		--parameter="soc/testbench/preload=$(preload)" \
 		--parameter="soc/testbench/standalone=$(standalone)" \
 		--parameter="soc/testbench/standalone_input=$(standalone_input)" \
+		--parameter="soc/testbench/no_stalls=$(no_stalls)" \
+		--parameter="soc/testbench/stall_probability=$(stall_probability)" \
+		--parameter="soc/testbench/stall_seed=$(stall_seed)" \
+		--parameter="soc/testbench/grant_file=$(if $(grant_file),$(abspath $(grant_file)),)" \
 		--parameter="soc/testbench/output_file=$(OUTPUT_DIR)/output.bin" run $(runner_args)
 
 clean:
