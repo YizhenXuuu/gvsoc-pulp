@@ -13,7 +13,7 @@
 class MXCoreTestbench : public vp::Component {
 public:
     explicit MXCoreTestbench(vp::ComponentConf &conf)
-        : vp::Component(conf), timer(this, step) {
+        : vp::Component(conf), timer(this, step), watchdog(this, timed_out) {
         input_file = get_js_config()->get_child_str("input_file");
         input_format = get_js_config()->get_child_str("input_format");
         output_format = get_js_config()->get_child_str("output_format");
@@ -64,23 +64,36 @@ public:
 
         memory_port.set_req_meth(access);
         completion.set_sync_meth(completed);
+        mmio.set_resp_meth(mmio_response);
+        mmio.set_grant_meth(mmio_grant);
         new_master_port("mmio", &mmio);
         new_slave_port("memory", &memory_port);
         new_slave_port("completion", &completion);
     }
 
     void reset(bool active) override {
+        reset_active = active;
         if (active) {
             if (timer.is_enqueued()) timer.cancel();
-            started = false;
+            if (watchdog.is_enqueued()) watchdog.cancel();
+            phase = Phase::START;
+            register_index = 0;
+            completion_seen = false;
+            // An asynchronous target still owns its request until response.
+            discard_mmio = mmio_state == MmioState::PENDING;
+            if (!discard_mmio) mmio_state = MmioState::IDLE;
             std::fill(memory.begin(), memory.end(), 0xa5);
             load_input();
         } else {
             timer.enqueue(10);
+            watchdog.enqueue(10 + TimeoutCycles);
         }
     }
 
 private:
+    enum class Phase { START, SOFT_CLEAR, ACQUIRE, PROGRAM, TRIGGER, WAIT_COMPLETION, DONE };
+    enum class MmioState { IDLE, PENDING, RETURNED };
+
     unsigned M, K, N, VS, NPE, Reuse;
     static constexpr unsigned Bandwidth = 64;
     static constexpr unsigned ABase = 0;
@@ -90,7 +103,16 @@ private:
     vp::IoSlave memory_port;
     vp::WireSlave<bool> completion;
     vp::ClockEvent timer;
-    bool started = false;
+    vp::ClockEvent watchdog;
+    Phase phase = Phase::START;
+    MmioState mmio_state = MmioState::IDLE;
+    std::array<uint8_t, 4> mmio_data{};
+    vp::IoReq mmio_request{0, nullptr, 4, false};
+    int64_t mmio_issued_at = 0;
+    unsigned register_index = 0;
+    bool reset_active = true;
+    bool discard_mmio = false;
+    bool completion_seen = false;
     bool preload = false;
     bool standalone = false;
     unsigned standalone_input_bits = 32;
@@ -117,48 +139,155 @@ private:
         if (!input) throw std::runtime_error("Cannot read input binary: " + input_file);
     }
 
-    uint32_t peripheral(unsigned address, bool write, uint32_t value = 0) {
-        uint8_t data[4];
-        for (unsigned i = 0; i < 4; ++i) data[i] = value >> (8 * i);
-        vp::IoReq request(address, data, 4, write);
-        request.set_initiator(0);
-        if (mmio.req(&request) != vp::IO_REQ_OK)
+    void peripheral(unsigned address, bool write, uint32_t value = 0) {
+        if (mmio_state != MmioState::IDLE)
+            throw std::logic_error("MXCore testbench already has an outstanding register access");
+        for (unsigned i = 0; i < mmio_data.size(); ++i) mmio_data[i] = value >> (8 * i);
+        mmio_request.init();
+        mmio_request.set_addr(address);
+        mmio_request.set_data(mmio_data.data());
+        mmio_request.set_size(mmio_data.size());
+        mmio_request.set_is_write(write);
+        mmio_request.set_initiator(0);
+        mmio_request.status = vp::IO_REQ_OK;
+        mmio_issued_at = clock.get_cycles();
+        mmio_state = MmioState::PENDING;
+
+        const auto status = mmio.req(&mmio_request);
+        if (status == vp::IO_REQ_OK) {
+            handle_mmio_response(&mmio_request);
+        } else if (status != vp::IO_REQ_PENDING && status != vp::IO_REQ_DENIED) {
             throw std::runtime_error("MXCore rejected a testbench register access");
+        }
+    }
+
+    void handle_mmio_response(vp::IoReq *request) {
+        if (request != &mmio_request || mmio_state != MmioState::PENDING)
+            throw std::logic_error("Unexpected MXCore testbench register response");
+        if (discard_mmio) {
+            discard_mmio = false;
+            mmio_state = MmioState::IDLE;
+            if (!reset_active && !timer.is_enqueued()) timer.enqueue(1);
+            return;
+        }
+        if (request->status != vp::IO_REQ_OK)
+            throw std::runtime_error("MXCore testbench register access failed");
+
+        mmio_state = MmioState::RETURNED;
+        const int64_t now = clock.get_cycles();
+        // Async callbacks may already account for some or all of this latency.
+        const int64_t ready_at = std::max(now, mmio_issued_at +
+            int64_t(std::max(uint64_t(1), request->get_full_latency())));
+        timer.enqueue(ready_at - now);
+    }
+
+    static void mmio_response(vp::Block *block, vp::IoReq *request) {
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        try {
+            self.handle_mmio_response(request);
+        } catch (const std::exception &error) {
+            self.fail(error.what());
+        }
+    }
+
+    static void mmio_grant(vp::Block *block, vp::IoReq *request) {
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        if (request != &self.mmio_request || self.mmio_state != MmioState::PENDING) {
+            self.fail("Unexpected MXCore testbench register grant");
+        }
+        // The target retains the request; wait for response without resubmitting.
+    }
+
+    void finish_peripheral() {
         uint32_t readback = 0;
-        for (unsigned i = 0; i < 4; ++i) readback |= uint32_t(data[i]) << (8 * i);
-        return readback;
+        for (unsigned i = 0; i < mmio_data.size(); ++i)
+            readback |= uint32_t(mmio_data[i]) << (8 * i);
+        const bool write = mmio_request.get_is_write();
+        mmio_state = MmioState::IDLE;
+
+        switch (phase) {
+        case Phase::SOFT_CLEAR:
+            phase = Phase::ACQUIRE;
+            break;
+        case Phase::ACQUIRE:
+            if (int32_t(readback) < 0)
+                throw std::runtime_error("MXCore did not grant a job context");
+            phase = Phase::PROGRAM;
+            break;
+        case Phase::PROGRAM:
+            if (++register_index == registers.size()) phase = Phase::TRIGGER;
+            break;
+        case Phase::TRIGGER:
+            phase = Phase::WAIT_COMPLETION;
+            if (completion_seen) finish_success();
+            return;
+        default:
+            throw std::logic_error("Unexpected completed MXCore register access");
+        }
+
+        // PERIPH_WRITE has a hold/termination edge; every next task has a setup edge.
+        // With the registered one-cycle response, issue intervals are 3/2 cycles
+        // after writes/reads, respectively, before adding any target stalls.
+        timer.enqueue(write ? 2 : 1);
     }
 
     static void step(vp::Block *block, vp::ClockEvent *) {
         auto &self = *static_cast<MXCoreTestbench *>(block);
         try {
-            if (self.started)
-                throw std::runtime_error("MXCore testbench completion timeout");
+            if (self.reset_active || self.discard_mmio) return;
+            if (self.mmio_state == MmioState::RETURNED) {
+                self.finish_peripheral();
+                return;
+            }
+            if (self.mmio_state == MmioState::PENDING) return;
 
-            std::cout << "[TB] Input=" << self.input_file << ", format=" << self.input_format
-                      << ", M=" << self.M << " K=" << self.K << " N=" << self.N
-                      << ", VS=" << self.VS << " Reuse=" << self.Reuse << " NPE=" << self.NPE
-                      << ", output=" << self.output_format << ", preload=" << self.preload
-                      << ", standalone=" << self.standalone
-                      << ", standalone_input_bits=" << self.standalone_input_bits << '\n';
-
-            self.peripheral(0x14, true, 0);
-
-            if (int32_t(self.peripheral(0x04, false)) < 0)
-                throw std::runtime_error("MXCore did not grant a job context");
-
-            for (unsigned index = 0; index < self.registers.size(); ++index)
-                self.peripheral(0x20 + index * 4, true, self.registers[index]);
-                
-            std::cout << "[TB] Triggering MXCore\n";
-            self.started = true;
-            self.timer.enqueue(TimeoutCycles);
-            self.peripheral(0x00, true, 0);
+            switch (self.phase) {
+            case Phase::START:
+                std::cout << "[TB] Input=" << self.input_file << ", format=" << self.input_format
+                          << ", M=" << self.M << " K=" << self.K << " N=" << self.N
+                          << ", VS=" << self.VS << " Reuse=" << self.Reuse << " NPE=" << self.NPE
+                          << ", output=" << self.output_format << ", preload=" << self.preload
+                          << ", standalone=" << self.standalone
+                          << ", standalone_input_bits=" << self.standalone_input_bits << '\n';
+                self.phase = Phase::SOFT_CLEAR;
+                self.timer.enqueue(1);
+                break;
+            case Phase::SOFT_CLEAR:
+                self.peripheral(0x14, true, 0);
+                break;
+            case Phase::ACQUIRE:
+                self.peripheral(0x04, false);
+                break;
+            case Phase::PROGRAM:
+                self.peripheral(0x20 + self.register_index * 4, true,
+                                self.registers[self.register_index]);
+                break;
+            case Phase::TRIGGER:
+                std::cout << "[TB] Triggering MXCore\n";
+                if (self.watchdog.is_enqueued()) self.watchdog.cancel();
+                self.watchdog.enqueue(TimeoutCycles);
+                self.peripheral(0x00, true, 0);
+                break;
+            case Phase::WAIT_COMPLETION:
+            case Phase::DONE:
+                break;
+            }
         } catch (const std::exception &error) {
-            std::cerr << "[TB] " << error.what() << '\n';
-            if (self.timer.is_enqueued()) self.timer.cancel();
-            self.time.get_engine()->quit(1);
+            self.fail(error.what());
         }
+    }
+
+    void fail(const std::string &message) {
+        std::cerr << "[TB] " << message << '\n';
+        if (timer.is_enqueued()) timer.cancel();
+        if (watchdog.is_enqueued()) watchdog.cancel();
+        phase = Phase::DONE;
+        time.get_engine()->quit(1);
+    }
+
+    static void timed_out(vp::Block *block, vp::ClockEvent *) {
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        self.fail("MXCore testbench register access or completion timeout");
     }
 
     static vp::IoReqStatus access(vp::Block *block, vp::IoReq *request) {
@@ -187,9 +316,23 @@ private:
     static void completed(vp::Block *block, bool value) {
         if (!value) return;
         auto &self = *static_cast<MXCoreTestbench *>(block);
-        if (self.timer.is_enqueued()) self.timer.cancel();
-        self.save_output();
-        self.time.get_engine()->quit(0);
+        if (self.reset_active || self.phase == Phase::DONE) return;
+        try {
+            if (self.phase != Phase::TRIGGER && self.phase != Phase::WAIT_COMPLETION)
+                throw std::logic_error("MXCore completed before the testbench trigger");
+            self.completion_seen = true;
+            if (self.phase == Phase::WAIT_COMPLETION) self.finish_success();
+        } catch (const std::exception &error) {
+            self.fail(error.what());
+        }
+    }
+
+    void finish_success() {
+        if (timer.is_enqueued()) timer.cancel();
+        if (watchdog.is_enqueued()) watchdog.cancel();
+        phase = Phase::DONE;
+        save_output();
+        time.get_engine()->quit(0);
     }
 };
 
