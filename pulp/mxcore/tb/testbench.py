@@ -10,19 +10,19 @@ class Testbench(gvsoc.systree.Component):
         super().__init__(parent, name)
 
         self.add_sources(['pulp/mxcore/tb/testbench.cpp'])
-        binary = TargetParameter(self, name='binary', value='input.bin',
-                                 description='MXCore input binary').get_value()        
+        memory_file = TargetParameter(self, name='memory_file', value='input.hex',
+                                      description='RTL $readmemh input: 32-bit hex words').get_value()
         input_format = TargetParameter(self, name='input', value='fp8',
                                        description='MXCore input format').get_value()    
-        output_format = TargetParameter(self, name='output', value='fp32',
+        output_format = TargetParameter(self, name='output', value='fp8',
                                         description='MXCore output format').get_value()
-        preload = TargetParameter(self, name='preload', value=0,
+        preload = TargetParameter(self, name='preload', value=1,
                                   description='Preload FP32 accumulator from the C region').get_value()
         standalone = TargetParameter(self, name='standalone', value=0,
                                      description='Quantize C without matrix multiplication').get_value()
         standalone_input = TargetParameter(self, name='standalone_input', value='fp32',
                                            description='Standalone C format: fp32 or bf16').get_value().lower()
-        no_stalls = TargetParameter(self, name='no_stalls', value=0,
+        no_stalls = TargetParameter(self, name='no_stalls', value=1,
                                    description='Disable TCDM bank stalls, matching RTL NO_STALLS=1').get_value()
         stall_probability = float(TargetParameter(self, name='stall_probability', value=0.1,
                                   description='Independent stall probability for each 32-bit TCDM port').get_value())
@@ -49,7 +49,7 @@ class Testbench(gvsoc.systree.Component):
                                       description='MXCore output binary').get_value()
         
         self.add_properties(self.get_format_config(input_format, output_format))
-        self.add_properties(dict(input_file=binary, input_format=input_format,
+        self.add_properties(dict(input_file=memory_file, input_format=input_format,
                                  output_format=output_format, output_file=output_file, preload=preload,
                                  standalone=standalone, standalone_input=standalone_input,
                                  standalone_input_bits=16 if standalone_input == 'bf16' else 32,
@@ -85,8 +85,19 @@ class Testbench(gvsoc.systree.Component):
     def o_DUT_INPUT(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('mmio', itf, signature='io')
 
+    def o_DUT_RESET(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('dut_reset', itf, signature='wire<bool>')
+
+    def i_COMPUTE_COMPLETION(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'compute_completion', signature='wire<bool>')
+
     def i_MEMORY(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, 'memory', signature='io')
 
     def i_COMPLETION(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, 'completion', signature='wire<bool>')
+
+    def gen_gtkw(self, tree, comp_traces):
+        if tree.get_view() == 'overview':
+            tree.add_trace(self, 'clk', vcd_signal='timing/clk', tag='overview')
+            tree.add_trace(self, 'reset', vcd_signal='timing/reset', tag='overview')

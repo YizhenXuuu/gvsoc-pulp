@@ -1,9 +1,12 @@
 #include <vp/vp.hpp>
 #include <vp/itf/io.hpp>
 #include <vp/itf/wire.hpp>
+#include <vp/register.hpp>
+#include <vp/time/time_event.hpp>
 #include "tb_tcdm_memory.hpp"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -20,7 +23,9 @@ class MXCoreTestbench : public vp::Component {
 public:
     explicit MXCoreTestbench(vp::ComponentConf &conf)
         : vp::Component(conf), timer(this, step), watchdog(this, timed_out),
-          memory_event(this, memory_step) {
+          memory_event(this, memory_step), monitor_event(this, monitor), tail_event(this, tail_done),
+          wave_clock_event(this, clock_wave), wave_reset(*this, "timing/reset", 1, true, 1),
+          wave_clk(*this, "timing/clk", 1, true, 1) {
         input_file = get_js_config()->get_child_str("input_file");
         input_format = get_js_config()->get_child_str("input_format");
         output_format = get_js_config()->get_child_str("output_format");
@@ -78,10 +83,13 @@ public:
 
         memory_port.set_req_meth(access);
         completion.set_sync_meth(completed);
+        compute_completion.set_sync_meth(compute_completed);
         mmio.set_resp_meth(mmio_response);
         mmio.set_grant_meth(mmio_grant);
         new_master_port("mmio", &mmio);
+        new_master_port("dut_reset", &dut_reset);
         new_slave_port("memory", &memory_port);
+        new_slave_port("compute_completion", &compute_completion);
         new_slave_port("completion", &completion);
     }
 
@@ -90,47 +98,85 @@ public:
         if (active) {
             if (timer.is_enqueued()) timer.cancel();
             if (watchdog.is_enqueued()) watchdog.cancel();
-            phase = Phase::START;
+            if (monitor_event.is_enqueued()) monitor_event.cancel();
+            if (tail_event.is_enqueued()) tail_event.cancel();
+            if (wave_clock_event.is_enqueued()) wave_clock_event.cancel();
+            wave_clk.set(1);
+            phase = Phase::RESET;
             register_index = 0;
+            acquire_reads = 0;
             completion_seen = false;
+            compute_seen = false;
+            compute_level = completion_level = false;
+            reset_release_cycle = trigger_issue_cycle = trigger_accept_cycle = trigger_return_cycle = -1;
+            compute_raised_cycle = completion_raised_cycle = compute_sample_cycle = completion_sample_cycle = -1;
             // An asynchronous target still owns its request until response.
             discard_mmio = mmio_state == MmioState::PENDING;
             if (!discard_mmio) mmio_state = MmioState::IDLE;
             // Release pre-reset transactions asynchronously without modifying reloaded data.
             for (auto &transfer : memory_requests) transfer.cancelled = true;
             std::fill(memory.begin(), memory.end(), 0xa5);
-            load_input();
+            if (dut_reset.is_bound()) dut_reset.sync(true);
+            wave_reset.set(1);
         } else {
-            timer.enqueue(10);
-            watchdog.enqueue(10 + TimeoutCycles);
+            // Display the fixed TB clock with rising edges on GVSOC cycle boundaries.
+            // This observer never drives the DUT and runs only when its VCD is selected.
+            if (wave_clk.reg_event.get_event_active())
+                wave_clock_event.enqueue(clock.get_period() / 2);
+            // rst_gen counts ten edges, then its reset FF releases on the next edge.
+            timer.enqueue(ResetCycles + 1);
+            watchdog.enqueue(ResetCycles + 1 + TimeoutCycles);
         }
     }
 
 private:
-    enum class Phase { START, SOFT_CLEAR, ACQUIRE, PROGRAM, TRIGGER, WAIT_COMPLETION, DONE };
+    enum class Phase {
+        RESET, START, SOFT_CLEAR, ACQUIRE, PROGRAM, TRIGGER, TRIGGER_RETURN,
+        WAIT_COMPLETION, FINISH_CLEAR, FINISH_CLEAR_RETURN, TAIL, DONE
+    };
     enum class MmioState { IDLE, PENDING, RETURNED };
 
     unsigned M, K, N, VS, NPE, Reuse;
     static constexpr unsigned Bandwidth = mxcore::tb::BeatBytes;
     static constexpr unsigned ABase = 0;
     static constexpr int64_t TimeoutCycles = 1000000;
+    static constexpr int64_t ResetCycles = 10;
+    static constexpr int64_t TailTimePs = 10000; // RTL #(10ns), independent of clock frequency.
 
     vp::IoMaster mmio;
+    vp::WireMaster<bool> dut_reset;
     vp::IoSlave memory_port;
     vp::WireSlave<bool> completion;
+    vp::WireSlave<bool> compute_completion;
     vp::ClockEvent timer;
     vp::ClockEvent watchdog;
     vp::ClockEvent memory_event;
-    Phase phase = Phase::START;
+    vp::ClockEvent monitor_event;
+    vp::TimeEvent tail_event;
+    vp::TimeEvent wave_clock_event;
+    vp::Register<uint32_t> wave_reset, wave_clk;
+    Phase phase = Phase::RESET;
     MmioState mmio_state = MmioState::IDLE;
     std::array<uint8_t, 4> mmio_data{};
     vp::IoReq mmio_request{0, nullptr, 4, false};
     int64_t mmio_issued_at = 0;
     unsigned register_index = 0;
+    unsigned acquire_reads = 0;
     bool reset_active = true;
     bool discard_mmio = false;
     bool completion_seen = false;
-    bool no_stalls = false;
+    bool compute_seen = false;
+    bool compute_level = false;
+    bool completion_level = false;
+    int64_t reset_release_cycle = -1;
+    int64_t trigger_issue_cycle = -1;
+    int64_t trigger_accept_cycle = -1;
+    int64_t trigger_return_cycle = -1;
+    int64_t compute_raised_cycle = -1;
+    int64_t completion_raised_cycle = -1;
+    int64_t compute_sample_cycle = -1;
+    int64_t completion_sample_cycle = -1;
+    bool no_stalls = true;
     double stall_probability = 0.1;
     unsigned stall_seed = 1;
     bool replay_grants = false;
@@ -159,19 +205,109 @@ private:
     std::string input_file, input_format, output_format;
     std::string output_file;
 
+    bool next_memory_token(std::istream &input, std::string &token,
+                           unsigned &line, unsigned &token_line) const {
+        token.clear();
+        for (;;) {
+            const int ch = input.peek();
+            if (ch == std::char_traits<char>::eof()) return !token.empty();
+            if (std::isspace(static_cast<unsigned char>(ch))) {
+                input.get();
+                if (ch == '\n') ++line;
+                if (!token.empty()) return true;
+                continue;
+            }
+            if (ch == '/') {
+                input.get();
+                const int kind = input.get();
+                if (kind == '/') {
+                    int current;
+                    while ((current = input.get()) != std::char_traits<char>::eof()) {
+                        if (current == '\n') {
+                            ++line;
+                            break;
+                        }
+                    }
+                } else if (kind == '*') {
+                    bool closed = false;
+                    int current;
+                    while ((current = input.get()) != std::char_traits<char>::eof()) {
+                        if (current == '\n') ++line;
+                        if (current == '*' && input.peek() == '/') {
+                            input.get();
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if (!closed)
+                        throw std::runtime_error("Unterminated comment in memory file " + input_file);
+                } else {
+                    throw std::runtime_error("Invalid memory file comment at line " + std::to_string(line));
+                }
+                if (!token.empty()) return true;
+                continue;
+            }
+            if (token.empty()) token_line = line;
+            token.push_back(char(input.get()));
+        }
+    }
+
+    uint32_t memory_hex_word(const std::string &token, unsigned line) const {
+        uint32_t value = 0;
+        bool has_digit = false;
+        for (unsigned char ch : token) {
+            if (ch == '_') continue;
+            unsigned digit;
+            if (ch >= '0' && ch <= '9') digit = ch - '0';
+            else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
+            else throw std::runtime_error("Invalid hex memory token '" + token + "' at line " +
+                                          std::to_string(line) + "; only known 32-bit words are supported");
+            if (value > 0x0fffffffu)
+                throw std::runtime_error("Hex memory word exceeds 32 bits at line " + std::to_string(line));
+            value = (value << 4) | digit;
+            has_digit = true;
+        }
+        if (!has_digit)
+            throw std::runtime_error("Missing hex memory value at line " + std::to_string(line));
+        return value;
+    }
+
     void load_input() {
-        std::ifstream input(input_file, std::ios::binary | std::ios::ate);
-        if (!input) throw std::runtime_error("Cannot open input binary: " + input_file);
-        const std::streamsize bytes = input.tellg();
-        if (bytes < 0) throw std::runtime_error("Cannot determine input binary size: " + input_file);
-        if (standalone && bytes < std::streamsize(result_base) + c_input_bytes)
-            throw std::runtime_error("Standalone binary must contain the complete FP32/BF16 C matrix");
-        if (!standalone && preload && bytes < std::streamsize(result_base) + c_input_bytes)
-            throw std::runtime_error("Preload binary must contain A, B, ScaleA, ScaleB and FP32 C");
-        if (std::size_t(bytes) > memory.size()) memory.resize(bytes, 0xa5);
-        input.seekg(0);
-        input.read(reinterpret_cast<char *>(memory.data() + ABase), bytes);
-        if (!input) throw std::runtime_error("Cannot read input binary: " + input_file);
+        std::ifstream input(input_file);
+        if (!input) throw std::runtime_error("Cannot open hex memory file: " + input_file);
+        const uint64_t required_bytes = uint64_t(result_base) +
+                                        ((preload || standalone) ? c_input_bytes : 0);
+        std::vector<bool> loaded((required_bytes + 3) / 4, false);
+        uint64_t word_address = ABase / 4;
+        uint64_t words = 0;
+        unsigned line = 1, token_line = 1;
+        std::string token;
+        while (next_memory_token(input, token, line, token_line)) {
+            if (token.front() == '@') {
+                // $readmemh addresses index memory[] words, not individual bytes.
+                word_address = memory_hex_word(token.substr(1), token_line);
+                continue;
+            }
+            const uint32_t value = memory_hex_word(token, token_line);
+            const uint64_t address = word_address * 4;
+            if (address > memory.size() || 4 > memory.size() - address)
+                throw std::runtime_error("Hex memory address outside configured TB memory at line " +
+                                         std::to_string(token_line));
+            for (unsigned byte = 0; byte < 4; ++byte)
+                memory[address + byte] = uint8_t(value >> (8 * byte));
+            if (word_address < loaded.size()) loaded[word_address] = true;
+            ++word_address;
+            ++words;
+        }
+        if (input.bad()) throw std::runtime_error("Cannot read hex memory file: " + input_file);
+        const auto missing = std::find(loaded.begin(), loaded.end(), false);
+        if (missing != loaded.end()) {
+            std::ostringstream address;
+            address << std::hex << std::distance(loaded.begin(), missing);
+            throw std::runtime_error("Hex memory file is missing required input word @" + address.str());
+        }
+        std::cout << "[TB] Loaded " << words << " 32-bit hex memory words\n";
     }
 
     void load_grants(const std::string &path) {
@@ -226,6 +362,10 @@ private:
         mmio_state = MmioState::PENDING;
 
         const auto status = mmio.req(&mmio_request);
+        if (phase == Phase::TRIGGER &&
+            (status == vp::IO_REQ_OK || status == vp::IO_REQ_PENDING)) {
+            trigger_accept_cycle = mmio_issued_at;
+        }
         if (status == vp::IO_REQ_OK) {
             handle_mmio_response(&mmio_request);
         } else if (status != vp::IO_REQ_PENDING && status != vp::IO_REQ_DENIED) {
@@ -266,7 +406,10 @@ private:
         auto &self = *static_cast<MXCoreTestbench *>(block);
         if (request != &self.mmio_request || self.mmio_state != MmioState::PENDING) {
             self.fail("Unexpected MXCore testbench register grant");
+            return;
         }
+        if (!self.discard_mmio && self.phase == Phase::TRIGGER)
+            self.trigger_accept_cycle = self.clock.get_cycles();
         // The target retains the request; wait for response without resubmitting.
     }
 
@@ -282,16 +425,25 @@ private:
             phase = Phase::ACQUIRE;
             break;
         case Phase::ACQUIRE:
-            if (int32_t(readback) < 0)
-                throw std::runtime_error("MXCore did not grant a job context");
-            phase = Phase::PROGRAM;
+            // The RTL polls while status[31] is set; the watchdog bounds retries.
+            if (!(readback & (1u << 31))) {
+                std::cout << "[TB] Acquired context " << readback << " after " << acquire_reads
+                          << " reads @ cycle " << clock.get_cycles() - reset_release_cycle << '\n';
+                phase = Phase::PROGRAM;
+            }
             break;
         case Phase::PROGRAM:
             if (++register_index == registers.size()) phase = Phase::TRIGGER;
             break;
         case Phase::TRIGGER:
-            phase = Phase::WAIT_COMPLETION;
-            if (completion_seen) finish_success();
+            if (trigger_accept_cycle < 0)
+                throw std::logic_error("MXCore trigger response arrived without acceptance");
+            phase = Phase::TRIGGER_RETURN;
+            timer.enqueue(1); // PERIPH_WRITE's final termination edge.
+            return;
+        case Phase::FINISH_CLEAR:
+            phase = Phase::FINISH_CLEAR_RETURN;
+            timer.enqueue(1);
             return;
         default:
             throw std::logic_error("Unexpected completed MXCore register access");
@@ -303,10 +455,30 @@ private:
         timer.enqueue(write ? 2 : 1);
     }
 
+    static void clock_wave(vp::Block *block, vp::TimeEvent *) {
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        self.wave_clk.set(self.wave_clk.get() ^ 1u);
+        self.wave_clock_event.enqueue(self.clock.get_period() / 2);
+    }
+
     static void step(vp::Block *block, vp::ClockEvent *) {
         auto &self = *static_cast<MXCoreTestbench *>(block);
         try {
-            if (self.reset_active || self.discard_mmio) return;
+            if (self.reset_active) return;
+            if (self.phase == Phase::RESET) {
+                if (!self.dut_reset.is_bound())
+                    throw std::logic_error("MXCore testbench DUT reset is not connected");
+                self.reset_release_cycle = self.clock.get_cycles();
+                self.dut_reset.sync(false);
+                self.wave_reset.set(0);
+                self.load_input();
+                std::cout << "[TB] Reset released and input loaded @ absolute cycle "
+                          << self.reset_release_cycle << '\n';
+                self.phase = Phase::START;
+                self.timer.enqueue(0);
+                return;
+            }
+            if (self.discard_mmio) return;
             if (self.mmio_state == MmioState::RETURNED) {
                 self.finish_peripheral();
                 return;
@@ -320,7 +492,8 @@ private:
                           << ", VS=" << self.VS << " Reuse=" << self.Reuse << " NPE=" << self.NPE
                           << ", output=" << self.output_format << ", preload=" << self.preload
                           << ", standalone=" << self.standalone
-                          << ", standalone_input_bits=" << self.standalone_input_bits << '\n';
+                          << ", standalone_input_bits=" << self.standalone_input_bits
+                          << ", clock=" << self.clock.get_frequency() << "Hz\n";
                 self.phase = Phase::SOFT_CLEAR;
                 self.timer.enqueue(1);
                 break;
@@ -328,6 +501,7 @@ private:
                 self.peripheral(0x14, true, 0);
                 break;
             case Phase::ACQUIRE:
+                ++self.acquire_reads;
                 self.peripheral(0x04, false);
                 break;
             case Phase::PROGRAM:
@@ -335,12 +509,33 @@ private:
                                 self.registers[self.register_index]);
                 break;
             case Phase::TRIGGER:
-                std::cout << "[TB] Triggering MXCore\n";
+                self.trigger_issue_cycle = self.clock.get_cycles();
+                std::cout << "[TB] Trigger request @ cycle "
+                          << self.trigger_issue_cycle - self.reset_release_cycle << '\n';
                 if (self.watchdog.is_enqueued()) self.watchdog.cancel();
                 self.watchdog.enqueue(TimeoutCycles);
+                self.monitor_event.enqueue(1);
                 self.peripheral(0x00, true, 0);
                 break;
+            case Phase::TRIGGER_RETURN:
+                self.trigger_return_cycle = self.clock.get_cycles();
+                std::cout << "[TB] Trigger accepted @ cycle "
+                          << self.trigger_accept_cycle - self.reset_release_cycle
+                          << "; write task returned @ cycle "
+                          << self.trigger_return_cycle - self.reset_release_cycle << '\n';
+                self.phase = Phase::WAIT_COMPLETION;
+                if (self.completion_seen) self.begin_finish();
+                break;
+            case Phase::FINISH_CLEAR:
+                self.peripheral(0x14, true, 0);
+                break;
+            case Phase::FINISH_CLEAR_RETURN:
+                self.phase = Phase::TAIL;
+                self.tail_event.enqueue(TailTimePs);
+                break;
+            case Phase::RESET:
             case Phase::WAIT_COMPLETION:
+            case Phase::TAIL:
             case Phase::DONE:
                 break;
             }
@@ -353,6 +548,9 @@ private:
         std::cerr << "[TB] " << message << '\n';
         if (timer.is_enqueued()) timer.cancel();
         if (watchdog.is_enqueued()) watchdog.cancel();
+        if (monitor_event.is_enqueued()) monitor_event.cancel();
+        if (tail_event.is_enqueued()) tail_event.cancel();
+        if (wave_clock_event.is_enqueued()) wave_clock_event.cancel();
         phase = Phase::DONE;
         time.get_engine()->quit(1);
     }
@@ -419,15 +617,79 @@ private:
                   << "[TB] Execution finished.\n";
     }
 
+    static void compute_completed(vp::Block *block, bool value) {
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        self.compute_level = value;
+        if (!value || self.reset_active || self.phase == Phase::RESET || self.phase == Phase::DONE) return;
+        if (self.trigger_issue_cycle < 0) {
+            self.fail("MXCore compute event arrived before the testbench trigger");
+            return;
+        }
+        if (self.compute_raised_cycle < 0) self.compute_raised_cycle = self.clock.get_cycles();
+    }
+
     static void completed(vp::Block *block, bool value) {
-        if (!value) return;
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        self.completion_level = value;
+        if (!value || self.reset_active || self.phase == Phase::RESET || self.phase == Phase::DONE) return;
+        if (self.trigger_issue_cycle < 0) {
+            self.fail("MXCore output event arrived before the testbench trigger");
+            return;
+        }
+        if (self.completion_raised_cycle < 0) self.completion_raised_cycle = self.clock.get_cycles();
+    }
+
+    static void monitor(vp::Block *block, vp::ClockEvent *) {
         auto &self = *static_cast<MXCoreTestbench *>(block);
         if (self.reset_active || self.phase == Phase::DONE) return;
         try {
-            if (self.phase != Phase::TRIGGER && self.phase != Phase::WAIT_COMPLETION)
-                throw std::logic_error("MXCore completed before the testbench trigger");
-            self.completion_seen = true;
-            if (self.phase == Phase::WAIT_COMPLETION) self.finish_success();
+            const int64_t now = self.clock.get_cycles();
+            // Sample each event on the next edge, before that edge's DUT updates.
+            // Assertion timestamps keep callback ordering from losing a pulse.
+            if (!self.compute_seen && self.compute_raised_cycle >= 0 && now > self.compute_raised_cycle) {
+                self.compute_seen = true;
+                self.compute_sample_cycle = now;
+                std::cout << "[TB] Compute done: asserted cycle "
+                          << self.compute_raised_cycle - self.reset_release_cycle
+                          << ", sampled cycle " << now - self.reset_release_cycle << '\n';
+            }
+            if (!self.completion_seen && self.completion_raised_cycle >= 0 && now > self.completion_raised_cycle) {
+                self.completion_seen = true;
+                self.completion_sample_cycle = now;
+                std::cout << "[TB] Output done: asserted cycle "
+                          << self.completion_raised_cycle - self.reset_release_cycle
+                          << ", sampled cycle " << now - self.reset_release_cycle << '\n';
+                if (self.phase == Phase::WAIT_COMPLETION) self.begin_finish();
+            }
+            if (!self.completion_seen) self.monitor_event.enqueue(1);
+        } catch (const std::exception &error) {
+            self.fail(error.what());
+        }
+    }
+
+    void begin_finish() {
+        if (!compute_seen || trigger_return_cycle < 0)
+            throw std::logic_error("MXCore output completed without compute/trigger completion");
+        std::cout << "[TB] Summary: " << completion_sample_cycle - trigger_return_cycle
+                  << " cycles from trigger write task return to sampled output done\n"
+                  << "[TB] Trigger write task return to sampled compute done: "
+                  << compute_sample_cycle - trigger_return_cycle << " cycles\n"
+                  << "[TB] Accepted trigger to event assertion: compute="
+                  << compute_raised_cycle - trigger_accept_cycle << ", output="
+                  << completion_raised_cycle - trigger_accept_cycle << " cycles\n";
+        if (watchdog.is_enqueued()) watchdog.cancel();
+        watchdog.enqueue(TimeoutCycles);
+        phase = Phase::FINISH_CLEAR;
+        timer.enqueue(1); // Setup edge for the RTL TB's final PERIPH_WRITE.
+    }
+
+    static void tail_done(vp::Block *block, vp::TimeEvent *) {
+        auto &self = *static_cast<MXCoreTestbench *>(block);
+        if (self.reset_active || self.phase != Phase::TAIL) return;
+        try {
+            if (self.compute_level || self.completion_level)
+                throw std::logic_error("MXCore completion events remain asserted after final soft clear");
+            self.finish_success();
         } catch (const std::exception &error) {
             self.fail(error.what());
         }
@@ -436,6 +698,9 @@ private:
     void finish_success() {
         if (timer.is_enqueued()) timer.cancel();
         if (watchdog.is_enqueued()) watchdog.cancel();
+        if (monitor_event.is_enqueued()) monitor_event.cancel();
+        if (tail_event.is_enqueued()) tail_event.cancel();
+        if (wave_clock_event.is_enqueued()) wave_clock_event.cancel();
         phase = Phase::DONE;
         save_output();
         time.get_engine()->quit(0);

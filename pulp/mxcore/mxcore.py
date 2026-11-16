@@ -106,3 +106,12 @@ class MXCore(gvsoc.systree.Component):
     def gen_gtkw(self, tree, comp_traces):
         if tree.get_view() == 'overview':
             tree.add_trace(self, self.name, vcd_signal='busy', tag='overview')
+            tree.add_trace(self, 'state', vcd_signal='state', tag='overview')
+            # Stream IDs: A=0, B=1, SA=2, SB=3, Z=4, SZ=5, C=6.
+            # dotp_fire[0/1]: input/retire; pipe_valid[0..3]: first..last stage.
+            # result_fire: row accepted by quantizer/output FIFOs.
+            # events[0/1]: compute/output completion wire levels.
+            for name in ('tcdm_req', 'tcdm_gnt', 'tcdm_rsp', 'tcdm_addr', 'tcdm_stream',
+                         'dotp_fire', 'pipe_valid', 'result_fire',
+                         'preload_wait', 'preload_count', 'events'):
+                tree.add_trace(self, name, vcd_signal=f'timing/{name}', tag='overview')

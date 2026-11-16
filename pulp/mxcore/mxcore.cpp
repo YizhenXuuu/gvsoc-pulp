@@ -154,6 +154,9 @@ class MXCore : public vp::Component {
     void     issue_request(unsigned slot_id);
     void     handle_response(unsigned slot_id, int64_t response_cycle);
     void     process_responses();
+    void     trace_compute_state();
+    void     trace_responses();
+    static void trace_pulse(vp::Event &event, uint32_t value = 1);
 
     static bool                      power_of_two(unsigned value);
     static void                      append32(Bytes &bytes, uint32_t value);
@@ -169,6 +172,15 @@ class MXCore : public vp::Component {
     vp::ClockEvent        *fsm_event;
     vp::Register<uint32_t> reg_fsm_state;
     vp::Register<uint32_t> reg_busy;
+    // State snapshots use registers; handshake/completion pulses use events.
+    vp::Event wave_req, wave_gnt, wave_rsp;
+    vp::Register<uint32_t> wave_addr, wave_stream;
+    vp::Event wave_dotp_fire;
+    vp::Register<uint32_t> wave_pipe_valid;
+    vp::Event wave_result_fire;
+    vp::Register<uint32_t> wave_preload_wait, wave_preload_count;
+    vp::Event wave_events;
+    uint32_t wave_event_bits = 0;
     uint32_t               tcdm_block_total = 0; // Planned memory transfers for this job.
     uint32_t               fsm_counter = 0;      // Transfers submitted to the TCDM port.
     int64_t                next_bus_cycle = 0;
@@ -320,6 +332,7 @@ class MXCore : public vp::Component {
         uint64_t epoch;
         int64_t  issued_at;
         int64_t available_at;
+        bool response_traced = false;
     };
 
     std::vector<ReqSlot> req_slots;
@@ -340,6 +353,17 @@ extern "C" vp::Component *gv_new(vp::ComponentConf &config) {
 MXCore::MXCore(vp::ComponentConf &config)
     : vp::Component(config), reg_fsm_state(*this, "state", 2, true, IDLE),
       reg_busy(*this, "busy", 1, true, 0),
+      wave_req(*this, "timing/tcdm_req", 1),
+      wave_gnt(*this, "timing/tcdm_gnt", 1),
+      wave_rsp(*this, "timing/tcdm_rsp", 1),
+      wave_addr(*this, "timing/tcdm_addr", 32, true, 0),
+      wave_stream(*this, "timing/tcdm_stream", 3, true, 0),
+      wave_dotp_fire(*this, "timing/dotp_fire", 2),
+      wave_pipe_valid(*this, "timing/pipe_valid", 4, true, 0),
+      wave_result_fire(*this, "timing/result_fire", 1),
+      wave_preload_wait(*this, "timing/preload_wait", 1, true, 0),
+      wave_preload_count(*this, "timing/preload_count", 32, true, 0),
+      wave_events(*this, "timing/events", 2),
       // MXDotp has no default constructor; its arithmetic/configuration is unchanged.
       dotp(get_js_config()->get("vector_size")->get_int()) {
 
@@ -420,6 +444,8 @@ void MXCore::clear_events() {
 
     this->event_pending = false;
     this->sw_evt = 0;
+    this->wave_event_bits = 0;
+    this->wave_events.dump(reinterpret_cast<uint8_t *>(&this->wave_event_bits));
 }
 
 void MXCore::reset(bool active) {
@@ -476,6 +502,14 @@ void MXCore::clear_engine() {
     this->dotp_result_valid.assign(this->pipe_regs, false);
     this->job_state = 0;
     this->clear_events();
+    uint32_t zero = 0;
+    for (vp::Event *event : {&this->wave_req, &this->wave_gnt, &this->wave_rsp,
+                            &this->wave_dotp_fire, &this->wave_result_fire}) {
+        event->dump(reinterpret_cast<uint8_t *>(&zero));
+    }
+    this->wave_addr.set(0);
+    this->wave_stream.set(0);
+    this->trace_compute_state();
 }
 
 // every SOFT_CLEAR write clears control/data-path state; only zero
@@ -750,6 +784,7 @@ void MXCore::start_next_job() {
 
     this->dotp_result_valid.assign(this->pipe_regs, false);
     std::fill(this->dotp_result_status.begin(), this->dotp_result_status.end(), 0);
+    this->trace_compute_state();
     this->timer_start = this->time.get_time();
     this->cycle_start = this->clock.get_cycles();
     this->result_rr_counter = false;
@@ -791,6 +826,8 @@ void MXCore::finish_job() {
     if (this->events[core][1].is_bound()) {
         this->events[core][1].sync(true);
     }
+    this->wave_event_bits |= 2;
+    this->wave_events.dump(reinterpret_cast<uint8_t *>(&this->wave_event_bits));
 
     if (this->done.is_bound()) {
         this->done.sync(true);
@@ -952,6 +989,7 @@ unsigned MXCore::alloc_req_slot(unsigned stream) {
     slot.stream = stream;
     slot.epoch = this->epoch;
     slot.available_at = this->clock.get_cycles() + 1;
+    slot.response_traced = false;
     slot.req->prepare();
     slot.req->set_data(slot.buf);
     slot.req->status = vp::IO_REQ_OK;
@@ -1025,6 +1063,7 @@ void MXCore::handle_response(unsigned slot_id, int64_t response_cycle) {
     // The HCI response buffer adds one cycle. A read still owns the slot until
     // process_responses() transfers its data into the input FIFO.
     slot.available_at = response_cycle + 1;
+    this->trace_responses();
     this->check_state();
 }
 
@@ -1043,6 +1082,11 @@ void MXCore::tcdm_response(vp::Block *__this, vp::IoReq *req) {
 void MXCore::tcdm_grant(vp::Block *__this, vp::IoReq *req) {
     MXCore *_this = static_cast<MXCore *>(__this);
     if (_this->denied_req_slot >= 0 && _this->req_slots[_this->denied_req_slot].req == req) {
+        if (_this->req_slots[_this->denied_req_slot].epoch == _this->epoch) {
+            trace_pulse(_this->wave_gnt);
+            uint32_t zero = 0;
+            _this->wave_req.dump_next(reinterpret_cast<uint8_t *>(&zero), 1);
+        }
         _this->denied_req_slot = -1;
         // A delayed grant occupies this cycle's wide port, even if the FSM
         // executes later in the same cycle.
@@ -1092,8 +1136,18 @@ void MXCore::issue_request(unsigned slot_id) {
     slot.issued_at = now;
     ++this->fsm_counter;
     slot.available_at = INT64_MAX;
+    uint32_t one = 1;
+    this->wave_addr.set(uint32_t(slot.req->get_addr()));
+    this->wave_stream.set(slot.stream);
+    this->wave_req.dump(reinterpret_cast<uint8_t *>(&one));
     const auto response = this->tcdm_itf.req(slot.req);
     this->next_bus_cycle = now + std::max(uint64_t(1), slot.req->get_duration());
+    if (response == vp::IO_REQ_OK || response == vp::IO_REQ_PENDING) {
+        // Both statuses accept the request immediately; DENIED waits for grant().
+        trace_pulse(this->wave_gnt);
+        uint32_t zero = 0;
+        this->wave_req.dump_next(reinterpret_cast<uint8_t *>(&zero), 1);
+    }
     if (response == vp::IO_REQ_OK) {
         this->handle_response(slot_id, now + int64_t(slot.req->get_full_latency()));
     } else if (response == vp::IO_REQ_DENIED) {
@@ -1148,6 +1202,37 @@ void MXCore::process_responses() {
  *                   Compute Engine and FSM                   *
  ************************************************************/
 
+void MXCore::trace_pulse(vp::Event &event, uint32_t value) {
+    if (!value) return;
+    event.dump(reinterpret_cast<uint8_t *>(&value));
+    uint32_t zero = 0;
+    // The trace engine clears the pulse even after the last FSM callback.
+    event.dump_next(reinterpret_cast<uint8_t *>(&zero), 1);
+}
+
+void MXCore::trace_compute_state() {
+    uint32_t valid = 0;
+    for (unsigned stage = 0; stage < this->dotp_result_valid.size(); ++stage) {
+        valid |= uint32_t(this->dotp_result_valid[stage]) << stage;
+    }
+    // Post-edge state: bit 0 is the first pipeline stage, bit 3 the last.
+    this->wave_pipe_valid.set(valid);
+    this->wave_preload_wait.set(this->preload_wait);
+    this->wave_preload_count.set(this->preload_count);
+}
+
+void MXCore::trace_responses() {
+    const auto now = this->clock.get_cycles();
+    for (auto &slot : this->req_slots) {
+        if (slot.epoch == this->epoch && slot.state == REQ_RETURNED &&
+            !slot.response_traced && slot.available_at - 1 <= now) {
+            // Observe the bus response, before the extra HCI buffer cycle.
+            trace_pulse(this->wave_rsp);
+            slot.response_traced = true;
+        }
+    }
+}
+
 void MXCore::push_result_row(const std::vector<uint32_t> &last) {
     Bytes values, scales;
 
@@ -1174,6 +1259,7 @@ void MXCore::push_result_row(const std::vector<uint32_t> &last) {
 
     this->output_push(0, std::move(values));
     ++this->final_rows;
+    trace_pulse(this->wave_result_fire);
 }
 
 void MXCore::process_iter_instruction() {
@@ -1253,6 +1339,8 @@ void MXCore::process_standalone() {
         if (this->events[this->offloading_core][0].is_bound()) {
             this->events[this->offloading_core][0].sync(true);
         }
+        this->wave_event_bits |= 1;
+        this->wave_events.dump(reinterpret_cast<uint8_t *>(&this->wave_event_bits));
         this->event_pending = true;
     }
 
@@ -1430,6 +1518,8 @@ void MXCore::process_compute() {
             if (this->events[this->offloading_core][0].is_bound()) {
                 this->events[this->offloading_core][0].sync(true);
             }
+            this->wave_event_bits |= 1;
+            this->wave_events.dump(reinterpret_cast<uint8_t *>(&this->wave_event_bits));
             this->event_pending = true;
         }
     }
@@ -1457,6 +1547,9 @@ void MXCore::process_compute() {
     if (compute_valid) {
         this->reg_fsm_state.set(last_iteration ? STORING : ROUTINE);
     }
+    // bit 0: MXDOTP input accepted; bit 1: result retired into partial sums.
+    trace_pulse(this->wave_dotp_fire, uint32_t(compute_valid) | (uint32_t(retire_valid) << 1));
+    this->trace_compute_state();
 }
 
 bool MXCore::next_iteration(bool count_in, bool count_out) {
@@ -1495,6 +1588,8 @@ void MXCore::check_state() {
 
 void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     MXCore *_this = static_cast<MXCore *>(__this);
+    // Synchronous targets can report a future response via request latency.
+    _this->trace_responses();
     
     if (_this->event_pending || _this->sw_evt) {
         _this->clear_events();

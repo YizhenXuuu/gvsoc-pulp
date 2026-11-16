@@ -11,9 +11,9 @@ class Test(gvsoc.systree.Component):
     def __init__(self, parent, name):
         super().__init__(parent, name)
 
-        m = TargetParameter(self, name='m', value=64, description='Matrix A rows').get_value()
-        k = TargetParameter(self, name='k', value=64, description='Matrix inner dimension').get_value()
-        n = TargetParameter(self, name='n', value=32, description='Matrix B columns').get_value()
+        m = TargetParameter(self, name='m', value=128, description='Matrix A rows').get_value()
+        k = TargetParameter(self, name='k', value=128, description='Matrix inner dimension').get_value()
+        n = TargetParameter(self, name='n', value=128, description='Matrix B columns').get_value()
         vs = TargetParameter(self, name='vs', value=32, description='MXCore hardware byte lanes').get_value()
         reuse = TargetParameter(self, name='reuse', value=64, description='MXCore row reuse').get_value()
         npe = TargetParameter(self, name='npe', value=32, description='MXCore parallel dot products').get_value()
@@ -23,7 +23,9 @@ class Test(gvsoc.systree.Component):
         testbench = Testbench(self, 'testbench', m=m, k=k, n=n, vs=vs, reuse=reuse, npe=npe)
 
         testbench.o_DUT_INPUT(dut.i_INPUT())
+        testbench.o_DUT_RESET(dut.i_RESET())
         dut.o_TCDM(testbench.i_MEMORY())
+        dut.o_EVENT(testbench.i_COMPUTE_COMPLETION(), event=0)
         dut.o_EVENT(testbench.i_COMPLETION(), event=1)
 
 
@@ -33,7 +35,7 @@ class Chip(gvsoc.systree.Component):
 
         super().__init__(parent, name)
 
-        clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=100000000)
+        clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=500000000)
         soc = Test(self, 'soc')
         clock.o_CLOCK(soc.i_CLOCK())
 
