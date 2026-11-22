@@ -240,6 +240,7 @@ class MXCore : public vp::Component {
     unsigned b_col_tiles = 0;
     unsigned inner_tiles = 0; // Programmed K/VS, distinct from FP4 compute chunks K/(2*VS).
     unsigned inner_blocks = 0;
+    unsigned sa_vec_per_block = 0;
     uint32_t a_tile_size = 0;
     uint32_t b_tile_size = 0;
     uint32_t result_tile_size = 0;
@@ -688,7 +689,8 @@ void MXCore::start_next_job() {
     this->a_row_tiles = this->reg_file[9] & 15; // M / Reuse
     this->b_col_tiles = (this->reg_file[9] >> 4) & 31; // N / NPE
     this->inner_tiles = (this->reg_file[9] >> 9) & 127; // K / VS
-    this->inner_blocks = (this->reg_file[9] >> 16) & 127; // K / input_block_size
+    this->inner_blocks = (this->reg_file[9] >> 16) & 127; // ceil(K / input_block_size)
+    this->sa_vec_per_block = (this->reg_file[9] >> 23) & 63;
     this->a_tile_size = this->reg_file[10];
     this->b_tile_size = this->reg_file[11];
     this->result_tile_size = this->reg_file[13];
@@ -710,11 +712,17 @@ void MXCore::start_next_job() {
         throw std::invalid_argument("requires full Reuse/NPE tiles");
     }
 
+    // A single short-K tile finishes before the fixed RTL scale reuse counters
+    // need to advance to the next tile. Keep other partial-block jobs unsupported.
+    const bool single_short_block = this->k_size < this->input_block_size &&
+                                    this->m_size == this->reuse && this->n_size == this->npe;
     if (!this->standalone &&
         (!this->k_size || this->k_size % this->elements_per_dotp ||
-         this->k_size % this->input_block_size ||
+         (this->k_size % this->input_block_size && !single_short_block) ||
          this->k_size / this->elements_per_dotp * uint64_t(this->reuse) > 65535)) {
-        throw std::invalid_argument("requires full Reuse/NPE tiles and complete input vectors/scale blocks");
+        throw std::invalid_argument(
+            "requires complete input vectors, a 16-bit iteration count, and full scale blocks "
+            "except for a single short-K output tile");
     }
 
     const unsigned input_bits = fp4 ? 4u : 8u;
@@ -727,11 +735,11 @@ void MXCore::start_next_job() {
 
     if (!this->standalone &&
         (this->inner_tiles != this->k_size / this->vs ||
-         this->inner_blocks != this->k_size / this->input_block_size ||
+         this->inner_blocks != (this->k_size + this->input_block_size - 1) / this->input_block_size ||
          this->a_tile_size != this->reuse * this->vs * input_bits ||
          this->b_tile_size != this->npe * this->vs * input_bits ||
          this->iter_count != compute_chunks * this->reuse ||
-         ((this->reg_file[9] >> 23) & 63) != std::min(32u / this->vs, compute_chunks))) {
+         this->sa_vec_per_block != std::min(32u / this->vs, compute_chunks))) {
         throw std::invalid_argument("inconsistent programmed GEMM tile sizes/iteration count");
     }
 
@@ -842,7 +850,7 @@ void MXCore::init_mxcore_meta_data() {
                    z_tile = this->result_tile_size;
     // INNER_TILES retains K/VS; FP4 tile sizes contain four bits per element.
     const uint64_t arow = a_tile * kt, bmat = b_tile * kt * bc;
-    // E8M0 scales: K/32 blocks for FP8, K/64 for FP4.
+    // E8M0 scales: ceil(K/32) blocks for FP8, ceil(K/64) for FP4.
     const uint64_t satile = this->reuse * 8, sarow = satile * kb, samat = sarow * ar,
                    sbmat = this->npe * 8 * kb * bc;
 
@@ -917,7 +925,7 @@ uint32_t MXCore::get_routine_access_block_number() {
 
     if (this->reuse > this->bandwidth) {
         this->stream_total[STREAM_SA] = uint64_t(this->reuse) *
-                                        (this->input_block_size / this->elements_per_dotp) * this->inner_blocks *
+                                        this->sa_vec_per_block * this->inner_blocks *
                                         this->b_col_tiles / this->bandwidth;
     } else {
         this->stream_total[STREAM_SA] =
@@ -1692,9 +1700,9 @@ uint32_t MXCore::next_addr(unsigned stream) {
             if (this->reuse > this->bandwidth) {
                 const unsigned tile_beats = this->reuse / this->bandwidth;
                 if (count % tile_beats == 0) {
-                    // Large Scale A: replay each scale tile 32/VS times.
+                    // Large Scale A: the programmed replay count is clamped for short K.
                     const unsigned block = count / tile_beats /
-                                             (this->input_block_size / this->elements_per_dotp) % this->inner_blocks;
+                                             this->sa_vec_per_block % this->inner_blocks;
                     this->iter_scale_a_addr = this->calculate_tile_base_address(
                         this->scale_a_addr, this->reuse, this->inner_blocks, 0, block);
                 }
