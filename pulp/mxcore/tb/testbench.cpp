@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -30,6 +31,7 @@ public:
         input_format = get_js_config()->get_child_str("input_format");
         output_format = get_js_config()->get_child_str("output_format");
         output_file = get_js_config()->get_child_str("output_file");
+        golden_file = get_js_config()->get_child_str("golden_file");
         preload = get_js_config()->get_child_int("preload");
         standalone = get_js_config()->get_child_int("standalone");
         standalone_input_bits = get_js_config()->get_child_int("standalone_input_bits");
@@ -56,14 +58,14 @@ public:
         const unsigned a_row_tiles = M / Reuse;
         const unsigned b_col_tiles = N / NPE;
         const unsigned inner_tiles = K / VS;
-        const unsigned inner_blocks = K / input_block;
+        const unsigned inner_blocks = (K + input_block - 1) / input_block;
         const unsigned compute_chunks = K / elements_per_dotp;
-        const unsigned reuse_d_reg_size = std::min(32u / VS, compute_chunks);
+        const unsigned sa_vec_per_block = std::min(32u / VS, compute_chunks);
         result_bits = get_js_config()->get_child_int("result_bits");
         b_base = standalone ? ABase : ABase + M * K * input_bits / 8;
         scale_a_base = standalone ? ABase : b_base + K * N * input_bits / 8;
-        scale_b_base = standalone ? ABase : scale_a_base + M * (K / input_block);
-        result_base = standalone ? ABase : scale_b_base + N * (K / input_block);
+        scale_b_base = standalone ? ABase : scale_a_base + M * inner_blocks;
+        result_base = standalone ? ABase : scale_b_base + N * inner_blocks;
         scale_bytes = result_bits <= 8 ? M * N / 32 : 0;
         result_bytes = M * N * result_bits / 8;
         c_input_bytes = standalone ? M * N * standalone_input_bits / 8 : preload ? M * N * 4 : 0;
@@ -75,7 +77,7 @@ public:
                      input_control | (19u << 3) | output_control | (uint32_t(preload) << 26) |
                          (uint32_t(standalone) << 27) |
                          (uint32_t(standalone && standalone_input_bits == 16) << 28),
-                     ((reuse_d_reg_size & 63u) << 23) | ((inner_blocks & 127u) << 16) |
+                     ((sa_vec_per_block & 63u) << 23) | ((inner_blocks & 127u) << 16) |
                          ((inner_tiles & 127u) << 9) | ((b_col_tiles & 31u) << 4) | (a_row_tiles & 15u),
                      Reuse * VS * input_bits, NPE * VS * input_bits,
                      Reuse * NPE * (standalone ? standalone_input_bits : 32),
@@ -203,10 +205,11 @@ private:
     unsigned b_base, scale_a_base, scale_b_base, result_base;
     unsigned result_bits, result_bytes, scale_base, scale_bytes;
     std::string input_file, input_format, output_format;
-    std::string output_file;
+    std::string output_file, golden_file;
+    std::vector<uint8_t> golden_output;
 
     bool next_memory_token(std::istream &input, std::string &token,
-                           unsigned &line, unsigned &token_line) const {
+                           unsigned &line, unsigned &token_line, const std::string &path) const {
         token.clear();
         for (;;) {
             const int ch = input.peek();
@@ -240,9 +243,10 @@ private:
                         }
                     }
                     if (!closed)
-                        throw std::runtime_error("Unterminated comment in memory file " + input_file);
+                        throw std::runtime_error("Unterminated comment in hex file " + path);
                 } else {
-                    throw std::runtime_error("Invalid memory file comment at line " + std::to_string(line));
+                    throw std::runtime_error("Invalid hex file comment in " + path + " at line " +
+                                             std::to_string(line));
                 }
                 if (!token.empty()) return true;
                 continue;
@@ -252,7 +256,7 @@ private:
         }
     }
 
-    uint32_t memory_hex_word(const std::string &token, unsigned line) const {
+    uint32_t memory_hex_word(const std::string &token, unsigned line, const std::string &path) const {
         uint32_t value = 0;
         bool has_digit = false;
         for (unsigned char ch : token) {
@@ -261,15 +265,16 @@ private:
             if (ch >= '0' && ch <= '9') digit = ch - '0';
             else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
             else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
-            else throw std::runtime_error("Invalid hex memory token '" + token + "' at line " +
+            else throw std::runtime_error("Invalid hex token '" + token + "' in " + path + " at line " +
                                           std::to_string(line) + "; only known 32-bit words are supported");
             if (value > 0x0fffffffu)
-                throw std::runtime_error("Hex memory word exceeds 32 bits at line " + std::to_string(line));
+                throw std::runtime_error("Hex word exceeds 32 bits in " + path + " at line " +
+                                         std::to_string(line));
             value = (value << 4) | digit;
             has_digit = true;
         }
         if (!has_digit)
-            throw std::runtime_error("Missing hex memory value at line " + std::to_string(line));
+            throw std::runtime_error("Missing hex value in " + path + " at line " + std::to_string(line));
         return value;
     }
 
@@ -280,16 +285,15 @@ private:
                                         ((preload || standalone) ? c_input_bytes : 0);
         std::vector<bool> loaded((required_bytes + 3) / 4, false);
         uint64_t word_address = ABase / 4;
-        uint64_t words = 0;
         unsigned line = 1, token_line = 1;
         std::string token;
-        while (next_memory_token(input, token, line, token_line)) {
+        while (next_memory_token(input, token, line, token_line, input_file)) {
             if (token.front() == '@') {
                 // $readmemh addresses index memory[] words, not individual bytes.
-                word_address = memory_hex_word(token.substr(1), token_line);
+                word_address = memory_hex_word(token.substr(1), token_line, input_file);
                 continue;
             }
-            const uint32_t value = memory_hex_word(token, token_line);
+            const uint32_t value = memory_hex_word(token, token_line, input_file);
             const uint64_t address = word_address * 4;
             if (address > memory.size() || 4 > memory.size() - address)
                 throw std::runtime_error("Hex memory address outside configured TB memory at line " +
@@ -298,7 +302,6 @@ private:
                 memory[address + byte] = uint8_t(value >> (8 * byte));
             if (word_address < loaded.size()) loaded[word_address] = true;
             ++word_address;
-            ++words;
         }
         if (input.bad()) throw std::runtime_error("Cannot read hex memory file: " + input_file);
         const auto missing = std::find(loaded.begin(), loaded.end(), false);
@@ -307,7 +310,90 @@ private:
             address << std::hex << std::distance(loaded.begin(), missing);
             throw std::runtime_error("Hex memory file is missing required input word @" + address.str());
         }
-        std::cout << "[TB] Loaded " << words << " 32-bit hex memory words\n";
+    }
+
+    void load_golden() {
+        std::ifstream input(golden_file);
+        if (!input) throw std::runtime_error("Cannot open golden result file: " + golden_file);
+        const size_t expected_bytes = size_t(result_bytes) + scale_bytes;
+        const size_t expected_words = (expected_bytes + 3) / 4;
+        golden_output.clear();
+        golden_output.reserve(expected_bytes);
+        size_t words = 0;
+        unsigned line = 1, token_line = 1;
+        std::string token;
+        while (next_memory_token(input, token, line, token_line, golden_file)) {
+            if (words == expected_words)
+                throw std::runtime_error("Golden result file has extra data: " + golden_file +
+                                         "; expected " + std::to_string(expected_words) + " 32-bit words");
+            const uint32_t value = memory_hex_word(token, token_line, golden_file);
+            // PyGolden packs little-endian 32-bit words as [Z][SZ]. Ignore final word padding.
+            for (unsigned byte = 0; byte < 4 && golden_output.size() < expected_bytes; ++byte)
+                golden_output.push_back(uint8_t(value >> (8 * byte)));
+            ++words;
+        }
+        if (input.bad()) throw std::runtime_error("Cannot read golden result file: " + golden_file);
+        if (words != expected_words)
+            throw std::runtime_error("Golden result file size mismatch: " + golden_file +
+                                     "; expected " + std::to_string(expected_words) +
+                                     " 32-bit words, got " + std::to_string(words));
+    }
+
+    size_t compare_region(const char *name, unsigned base, size_t golden_offset,
+                          size_t count, unsigned bits, unsigned &reported,
+                          std::string &first_mismatch) const {
+        size_t matched = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const size_t offset = i * bits / 8;
+            uint32_t actual = 0, expected = 0;
+            if (bits == 4) {
+                const unsigned shift = unsigned(i % 2) * 4;
+                actual = (memory[base + offset] >> shift) & 15u;
+                expected = (golden_output[golden_offset + offset] >> shift) & 15u;
+            } else {
+                for (unsigned byte = 0; byte < bits / 8; ++byte) {
+                    actual |= uint32_t(memory[base + offset + byte]) << (8 * byte);
+                    expected |= uint32_t(golden_output[golden_offset + offset + byte]) << (8 * byte);
+                }
+            }
+            if (actual == expected) {
+                ++matched;
+            } else if (reported < 8) {
+                std::ostringstream detail;
+                detail << name << '[' << i << "] @ 0x" << std::hex
+                       << base + offset << ": expected=0x" << std::setfill('0') << std::setw(bits / 4)
+                       << expected << ", actual=0x" << std::setw(bits / 4) << actual;
+                if (first_mismatch.empty()) first_mismatch = detail.str();
+                std::cout << "[TB] Mismatch " << detail.str() << '\n';
+                ++reported;
+            }
+        }
+        return matched;
+    }
+
+    void print_accuracy(const char *name, size_t matched, size_t total) const {
+        std::ostringstream summary;
+        summary << "[TB] " << name << ": ";
+        if (total)
+            summary << std::fixed << std::setprecision(6) << 100.0 * double(matched) / double(total);
+        else
+            summary << "N/A";
+        summary << " (" << matched << '/' << total << ')';
+        std::cout << summary.str() << '\n';
+    }
+
+    bool check_output() const {
+        const size_t values = size_t(M) * N;
+        unsigned reported = 0;
+        std::string first_mismatch;
+        const size_t z_matched = compare_region("Z", result_base, 0, values, result_bits, reported, first_mismatch);
+        const size_t sz_matched = compare_region("SZ", scale_base, result_bytes, scale_bytes, 8, reported, first_mismatch);
+        print_accuracy("Golden accuracy — Z (%)", z_matched, values);
+        print_accuracy("Golden accuracy — SZ (%)", sz_matched, scale_bytes);
+        const bool passed = z_matched == values && sz_matched == scale_bytes;
+        std::cout << "[TB] Golden check (PASS/FAIL): " << (passed ? "PASS" : "FAIL") << '\n'
+                  << "[TB] Notes / first mismatch: " << (passed ? "none" : first_mismatch) << '\n';
+        return passed;
     }
 
     void load_grants(const std::string &path) {
@@ -427,8 +513,6 @@ private:
         case Phase::ACQUIRE:
             // The RTL polls while status[31] is set; the watchdog bounds retries.
             if (!(readback & (1u << 31))) {
-                std::cout << "[TB] Acquired context " << readback << " after " << acquire_reads
-                          << " reads @ cycle " << clock.get_cycles() - reset_release_cycle << '\n';
                 phase = Phase::PROGRAM;
             }
             break;
@@ -472,8 +556,7 @@ private:
                 self.dut_reset.sync(false);
                 self.wave_reset.set(0);
                 self.load_input();
-                std::cout << "[TB] Reset released and input loaded @ absolute cycle "
-                          << self.reset_release_cycle << '\n';
+                self.load_golden();
                 self.phase = Phase::START;
                 self.timer.enqueue(0);
                 return;
@@ -487,13 +570,11 @@ private:
 
             switch (self.phase) {
             case Phase::START:
-                std::cout << "[TB] Input=" << self.input_file << ", format=" << self.input_format
-                          << ", M=" << self.M << " K=" << self.K << " N=" << self.N
-                          << ", VS=" << self.VS << " Reuse=" << self.Reuse << " NPE=" << self.NPE
-                          << ", output=" << self.output_format << ", preload=" << self.preload
-                          << ", standalone=" << self.standalone
-                          << ", standalone_input_bits=" << self.standalone_input_bits
-                          << ", clock=" << self.clock.get_frequency() << "Hz\n";
+                std::cout << "[TB] CONFIG M=" << self.M << " K=" << self.K << " N=" << self.N
+                          << " VS=" << self.VS << " NPE=" << self.NPE << " REUSE=" << self.Reuse
+                          << " input=" << self.input_format << " output=" << self.output_format
+                          << " preload=" << self.preload << " standalone=" << self.standalone
+                          << " no_stalls=" << self.no_stalls << '\n';
                 self.phase = Phase::SOFT_CLEAR;
                 self.timer.enqueue(1);
                 break;
@@ -510,8 +591,6 @@ private:
                 break;
             case Phase::TRIGGER:
                 self.trigger_issue_cycle = self.clock.get_cycles();
-                std::cout << "[TB] Trigger request @ cycle "
-                          << self.trigger_issue_cycle - self.reset_release_cycle << '\n';
                 if (self.watchdog.is_enqueued()) self.watchdog.cancel();
                 self.watchdog.enqueue(TimeoutCycles);
                 self.monitor_event.enqueue(1);
@@ -519,10 +598,6 @@ private:
                 break;
             case Phase::TRIGGER_RETURN:
                 self.trigger_return_cycle = self.clock.get_cycles();
-                std::cout << "[TB] Trigger accepted @ cycle "
-                          << self.trigger_accept_cycle - self.reset_release_cycle
-                          << "; write task returned @ cycle "
-                          << self.trigger_return_cycle - self.reset_release_cycle << '\n';
                 self.phase = Phase::WAIT_COMPLETION;
                 if (self.completion_seen) self.begin_finish();
                 break;
@@ -613,8 +688,7 @@ private:
         output.write(reinterpret_cast<const char *>(memory.data() + result_base), result_bytes);
         output.write(reinterpret_cast<const char *>(memory.data() + scale_base), scale_bytes);
         if (!output) throw std::runtime_error("Cannot write testbench output file");
-        std::cout << "[TB] Saved " << result_bytes + scale_bytes << " bytes to " << output_file << '\n'
-                  << "[TB] Execution finished.\n";
+        std::cout << "[TB] OUTPUT file=" << output_file << '\n';
     }
 
     static void compute_completed(vp::Block *block, bool value) {
@@ -649,16 +723,10 @@ private:
             if (!self.compute_seen && self.compute_raised_cycle >= 0 && now > self.compute_raised_cycle) {
                 self.compute_seen = true;
                 self.compute_sample_cycle = now;
-                std::cout << "[TB] Compute done: asserted cycle "
-                          << self.compute_raised_cycle - self.reset_release_cycle
-                          << ", sampled cycle " << now - self.reset_release_cycle << '\n';
             }
             if (!self.completion_seen && self.completion_raised_cycle >= 0 && now > self.completion_raised_cycle) {
                 self.completion_seen = true;
                 self.completion_sample_cycle = now;
-                std::cout << "[TB] Output done: asserted cycle "
-                          << self.completion_raised_cycle - self.reset_release_cycle
-                          << ", sampled cycle " << now - self.reset_release_cycle << '\n';
                 if (self.phase == Phase::WAIT_COMPLETION) self.begin_finish();
             }
             if (!self.completion_seen) self.monitor_event.enqueue(1);
@@ -670,13 +738,6 @@ private:
     void begin_finish() {
         if (!compute_seen || trigger_return_cycle < 0)
             throw std::logic_error("MXCore output completed without compute/trigger completion");
-        std::cout << "[TB] Summary: " << completion_sample_cycle - trigger_return_cycle
-                  << " cycles from trigger write task return to sampled output done\n"
-                  << "[TB] Trigger write task return to sampled compute done: "
-                  << compute_sample_cycle - trigger_return_cycle << " cycles\n"
-                  << "[TB] Accepted trigger to event assertion: compute="
-                  << compute_raised_cycle - trigger_accept_cycle << ", output="
-                  << completion_raised_cycle - trigger_accept_cycle << " cycles\n";
         if (watchdog.is_enqueued()) watchdog.cancel();
         watchdog.enqueue(TimeoutCycles);
         phase = Phase::FINISH_CLEAR;
@@ -689,13 +750,13 @@ private:
         try {
             if (self.compute_level || self.completion_level)
                 throw std::logic_error("MXCore completion events remain asserted after final soft clear");
-            self.finish_success();
+            self.finish_run();
         } catch (const std::exception &error) {
             self.fail(error.what());
         }
     }
 
-    void finish_success() {
+    void finish_run() {
         if (timer.is_enqueued()) timer.cancel();
         if (watchdog.is_enqueued()) watchdog.cancel();
         if (monitor_event.is_enqueued()) monitor_event.cancel();
@@ -703,7 +764,7 @@ private:
         if (wave_clock_event.is_enqueued()) wave_clock_event.cancel();
         phase = Phase::DONE;
         save_output();
-        time.get_engine()->quit(0);
+        time.get_engine()->quit(check_output() ? 0 : 1);
     }
 };
 

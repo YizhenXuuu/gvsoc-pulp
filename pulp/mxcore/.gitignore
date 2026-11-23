@@ -1,4 +1,6 @@
 .clang-format
 tb/binary
+tb/input
+tb/golden
 output_tb
 build

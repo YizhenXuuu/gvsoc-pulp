@@ -12,6 +12,13 @@ class Testbench(gvsoc.systree.Component):
         self.add_sources(['pulp/mxcore/tb/testbench.cpp'])
         memory_file = TargetParameter(self, name='memory_file', value='input.hex',
                                       description='RTL $readmemh input: 32-bit hex words').get_value()
+        golden_file = TargetParameter(self, name='golden_file', value='',
+                                      description='PyGolden result hex; defaults to tb/golden/result_<input suffix>.txt').get_value()
+        input_name = Path(memory_file).name
+        golden_name = ('result_' + input_name[len('data_memory_'):]
+                       if input_name.startswith('data_memory_') else f'result_{Path(input_name).stem}.txt')
+        golden_file = (Path(golden_file).expanduser().resolve() if golden_file
+                       else Path(__file__).resolve().parent / 'golden' / golden_name)
         input_format = TargetParameter(self, name='input', value='fp8',
                                        description='MXCore input format').get_value()    
         output_format = TargetParameter(self, name='output', value='fp8',
@@ -50,7 +57,8 @@ class Testbench(gvsoc.systree.Component):
         
         self.add_properties(self.get_format_config(input_format, output_format))
         self.add_properties(dict(input_file=memory_file, input_format=input_format,
-                                 output_format=output_format, output_file=output_file, preload=preload,
+                                 output_format=output_format, output_file=output_file,
+                                 golden_file=str(golden_file), preload=preload,
                                  standalone=standalone, standalone_input=standalone_input,
                                  standalone_input_bits=16 if standalone_input == 'bf16' else 32,
                                  no_stalls=no_stalls, stall_probability=stall_probability, stall_seed=stall_seed,
