@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // MXCore HWPE. Register input, clocked FSM and completion follow LightRedmule's
 // component structure; register semantics and the data path follow MXCore RTL.
+#include "hci_fifo.hpp"
 #include "mxdotp.hpp"
 #include "quantizer.hpp"
 #include <algorithm>
@@ -52,13 +53,15 @@ enum mxcore_req_state {
     REQ_FREE,
     REQ_QUEUED,
     REQ_PENDING,
-    REQ_RETURNED
+    REQ_RETURNED,
+    REQ_BUFFERED
 };
 
 static constexpr unsigned NB_INPUT_STREAMS = 4;
 static constexpr unsigned NB_OUTPUT_STREAMS = 2;
 static constexpr unsigned NB_TCDM_CHANNELS = 6;
 static constexpr unsigned STREAM_FIFO_DEPTH = 2;
+static_assert(STREAM_FIFO_DEPTH == mxcore::HciFifo::Depth, "RTL HCI FIFO depth");
 static constexpr unsigned NB_IO_REGS = 16;
 static constexpr unsigned MAX_CORES = 16;
 static constexpr unsigned NB_EVENTS = 2;
@@ -93,6 +96,7 @@ class MXCore : public vp::Component {
     // Peripheral input, clocked state machine and memory callbacks.
     static vp::IoReqStatus req(vp::Block *__this, vp::IoReq *req);
     static void            fsm_handler(vp::Block *__this, vp::ClockEvent *event);
+    static void            fsm_update(vp::Block *__this, vp::ClockEvent *event);
     static void            tcdm_response(vp::Block *__this, vp::IoReq *req);
     static void            tcdm_grant(vp::Block *__this, vp::IoReq *req);
 
@@ -126,8 +130,6 @@ class MXCore : public vp::Component {
     void             init_input_buffers();
     FifoLanes       &get_input_buffer(unsigned stream);
     const FifoLanes &get_input_buffer(unsigned stream) const;
-    bool             input_can_reserve(unsigned stream) const;
-    void             input_reserve(unsigned stream);
     bool             input_can_push(unsigned stream) const;
     bool             input_valid(unsigned stream) const;
     Bytes            input_peek(unsigned stream) const;
@@ -142,16 +144,20 @@ class MXCore : public vp::Component {
     unsigned                 output_peek(unsigned output, uint8_t *data) const;
     void                     output_pop(unsigned output);
 
-    bool     issue_slot_gate_ok(unsigned stream) const;
+    bool     issue_slot_gate_ok(unsigned stream);
+    static unsigned hci_channel(unsigned stream);
+    int      response_arrival(unsigned channel);
+    bool     response_consumer_ready(unsigned channel) const;
     void     init_req_slot(unsigned slot_id);
     unsigned alloc_req_slot(unsigned stream);
     void     free_req_slot(unsigned slot_id);
     bool     all_slots_free() const;
-    void     enqueue_read_requests(const std::array<bool, NB_INPUT_STREAMS> &room);
-    void     enqueue_preload_request(bool room);
+    void     enqueue_read_requests();
+    void     enqueue_preload_request();
     void     enqueue_write_request(bool result_valid, bool scale_valid);
     int      arbitrate_request();
     void     issue_request(unsigned slot_id);
+    void     accept_request(unsigned slot_id);
     void     handle_response(unsigned slot_id, int64_t response_cycle);
     void     process_responses();
     void     trace_compute_state();
@@ -170,6 +176,7 @@ class MXCore : public vp::Component {
 
     // MXCore FSM
     vp::ClockEvent        *fsm_event;
+    vp::ClockEvent        *fsm_update_event;
     vp::Register<uint32_t> reg_fsm_state;
     vp::Register<uint32_t> reg_busy;
     // State snapshots use registers; handshake/completion pulses use events.
@@ -276,12 +283,10 @@ class MXCore : public vp::Component {
     // Input stream metadata; array order is A, B, Scale A, Scale B.
     std::array<unsigned, NB_INPUT_STREAMS>              input_width{};
     std::array<unsigned, NB_INPUT_STREAMS>              input_push_lane{};
-    std::array<unsigned, NB_INPUT_STREAMS>              input_reserve_lane{};
     std::array<unsigned, NB_INPUT_STREAMS>              input_slice{};
     std::array<unsigned, NB_INPUT_STREAMS>              input_row{};
     std::array<unsigned, NB_INPUT_STREAMS>              input_scale_repeat{};
     std::array<unsigned, NB_INPUT_STREAMS>              input_block{};
-    std::array<std::vector<unsigned>, NB_INPUT_STREAMS> input_reserved;
     std::array<bool, NB_INPUT_STREAMS> input_push_ready{}; // FIFO readiness sampled before the edge.
     bool                               scale_b_short = false;
 
@@ -296,7 +301,6 @@ class MXCore : public vp::Component {
     FifoLanes                           b_buffer;
     FifoLanes                           scale_a_buffer;
     FifoLanes                           scale_b_buffer;
-    std::array<Bytes, NB_INPUT_STREAMS> fence;
     
     // one NPE-wide result, exception status and valid bit per stage.
     std::vector<std::vector<uint32_t>> dotp_result_buffer;
@@ -310,7 +314,6 @@ class MXCore : public vp::Component {
     std::deque<Bytes>                  result_buffer;
     std::deque<Bytes>                  result_scale_buffer;
     std::deque<Bytes>                  preload_buffer;
-    unsigned                           preload_reserved = 0;
     unsigned                           preload_row = 0;
     unsigned                           preload_word = 0;
     unsigned                           preload_count = 0;
@@ -337,8 +340,7 @@ class MXCore : public vp::Component {
     };
 
     std::vector<ReqSlot> req_slots;
-    std::array<std::deque<unsigned>, NB_STREAMS> pending;
-    std::deque<unsigned> output_requests; // Shared result request FIFO, in mux acceptance order.
+    std::array<mxcore::HciFifo, NB_TCDM_CHANNELS> hci_fifos;
     int      denied_req_slot = -1; // Denied request awaiting grant; -1 means none.
     uint64_t epoch = 0;
 };
@@ -393,6 +395,7 @@ MXCore::MXCore(vp::ComponentConf &config)
 
     // Initialize interfaces and the clocked FSM
     this->fsm_event = this->event_new(&MXCore::fsm_handler);
+    this->fsm_update_event = this->event_new(&MXCore::fsm_update);
     this->input_itf.set_req_meth(&MXCore::req);
     this->new_slave_port("input", &this->input_itf);
     this->new_master_port("done_irq", &this->done);
@@ -424,6 +427,10 @@ MXCore::~MXCore() {
         this->event_cancel(this->fsm_event);
     }
     delete this->fsm_event;
+    if (this->fsm_update_event->is_enqueued()) {
+        this->event_cancel(this->fsm_update_event);
+    }
+    delete this->fsm_update_event;
     for (auto &slot : this->req_slots) {
         this->tcdm_itf.req_del(slot.req);
         delete[] slot.buf;
@@ -465,11 +472,13 @@ void MXCore::clear_engine() {
     if (this->fsm_event->is_enqueued()) {
         this->event_cancel(this->fsm_event);
     }
-
-    for (auto &q : this->pending) {
-        q.clear();
+    if (this->fsm_update_event->is_enqueued()) {
+        this->event_cancel(this->fsm_update_event);
     }
-    this->output_requests.clear();
+
+    for (auto &fifo : this->hci_fifos) {
+        fifo.clear();
+    }
     this->result_rr_counter = false;
 
     for (unsigned i = 0; i < this->req_slots.size(); ++i) {
@@ -482,14 +491,12 @@ void MXCore::clear_engine() {
     this->b_buffer.clear();
     this->scale_a_buffer.clear();
     this->scale_b_buffer.clear();
-    this->fence = {};
     this->partial_sum_buffer.clear();
     this->partial_sum_valid.clear();
     this->partial_sum_final.clear();
     this->result_buffer.clear();
     this->result_scale_buffer.clear();
     this->preload_buffer.clear();
-    this->preload_reserved = 0;
     this->preload_row = this->preload_word = this->preload_count = this->preload_final_count = 0;
     this->preload_wait = this->preload_push_ready = false;
     this->standalone_buffer.clear();
@@ -766,7 +773,6 @@ void MXCore::start_next_job() {
     this->compute_count = 0;
     this->retired_count = 0;
     this->final_rows = 0;
-    this->fence = {};
     this->init_input_buffers();
     this->init_output_buffers();
     this->partial_sum_buffer.assign(this->standalone ? 0 : this->reuse,
@@ -774,7 +780,6 @@ void MXCore::start_next_job() {
     this->partial_sum_valid.assign(this->standalone ? 0 : this->reuse, false);
     this->partial_sum_final.assign(this->standalone ? 0 : this->reuse, false);
     this->preload_buffer.clear();
-    this->preload_reserved = 0;
     this->preload_row = this->preload_word = this->preload_count = this->preload_final_count = 0;
     this->preload_wait = this->preload;
     this->preload_push_ready = false;
@@ -796,7 +801,9 @@ void MXCore::start_next_job() {
     this->timer_start = this->time.get_time();
     this->cycle_start = this->clock.get_cycles();
     this->result_rr_counter = false;
-    this->output_requests.clear();
+    for (auto &fifo : this->hci_fifos) {
+        fifo.clear();
+    }
     this->reg_fsm_state.set(PRELOAD);
     this->reg_busy.set(1);
     this->trace.msg(vp::TraceLevel::DEBUG,
@@ -969,18 +976,35 @@ void MXCore::init_req_slot(unsigned slot_id) {
     std::memcpy(slot.req->arg_get(0), &slot_id, sizeof(slot_id));
 }
 
-bool MXCore::issue_slot_gate_ok(unsigned stream) const {
-    const unsigned channel = stream == STREAM_SZ ? STREAM_Z : stream;
-    unsigned       count = 0;
+bool MXCore::issue_slot_gate_ok(unsigned stream) {
+    return this->hci_fifos[hci_channel(stream)].request_push_ready(this->clock.get_cycles());
+}
+
+unsigned MXCore::hci_channel(unsigned stream) {
+    // Z and SZ enter the same outgoing FIFO after i_result_fifo_mux.
+    return stream == STREAM_C ? 5 : stream == STREAM_SZ ? STREAM_Z : stream;
+}
+
+int MXCore::response_arrival(unsigned channel) {
+    const auto now = this->clock.get_cycles();
+    int arrival = -1;
     for (unsigned i = 0; i < this->req_slots.size(); ++i) {
         const ReqSlot &slot = this->req_slots[i];
-        const bool     queued = slot.state == REQ_QUEUED || int(i) == this->denied_req_slot;
-        const bool same_channel = slot.stream == channel || (channel == STREAM_Z && slot.stream == STREAM_SZ);
-        if (queued && same_channel) {
-            ++count;
+        if (slot.epoch != this->epoch || slot.state != REQ_RETURNED || slot.req->get_is_write() ||
+            hci_channel(slot.stream) != channel || slot.available_at > now || slot.issued_at >= now) {
+            continue;
         }
+        if (arrival >= 0) {
+            throw std::logic_error("multiple MXCore HCI responses on one channel in one cycle");
+        }
+        arrival = int(i);
     }
-    return count < STREAM_FIFO_DEPTH;
+    return arrival;
+}
+
+bool MXCore::response_consumer_ready(unsigned channel) const {
+    return channel < NB_INPUT_STREAMS ? this->input_push_ready[channel]
+           : channel == hci_channel(STREAM_C) ? this->preload_push_ready : true;
 }
 
 unsigned MXCore::alloc_req_slot(unsigned stream) {
@@ -1001,7 +1025,7 @@ unsigned MXCore::alloc_req_slot(unsigned stream) {
     slot.req->prepare();
     slot.req->set_data(slot.buf);
     slot.req->status = vp::IO_REQ_OK;
-    this->pending[stream].push_back(i);
+    this->hci_fifos[hci_channel(stream)].push_request(i, this->clock.get_cycles());
     return i;
 }
 
@@ -1019,27 +1043,26 @@ bool MXCore::all_slots_free() const {
     return true;
 }
 
-void MXCore::enqueue_read_requests(const std::array<bool, NB_INPUT_STREAMS> &room) {
+void MXCore::enqueue_read_requests() {
     for (unsigned i = 0; i < NB_INPUT_STREAMS; ++i) {
-        if (room[i] && !this->stream_done(i) && this->issue_slot_gate_ok(i)) {
+        if (!this->stream_done(i) && this->issue_slot_gate_ok(i)) {
             ReqSlot &slot = this->req_slots[this->alloc_req_slot(i)];
             slot.req->set_addr(this->next_addr(i));
             slot.req->set_size(this->bandwidth);
             slot.req->set_is_write(false);
-            this->input_reserve(i);
         }
     }
 }
 
-void MXCore::enqueue_preload_request(bool room) {
-    if (!room || this->stream_done(STREAM_C) || !this->issue_slot_gate_ok(STREAM_C)) {
+void MXCore::enqueue_preload_request() {
+    if (!(this->preload || this->standalone) || this->stream_done(STREAM_C) ||
+        !this->issue_slot_gate_ok(STREAM_C)) {
         return;
     }
     ReqSlot &slot = this->req_slots[this->alloc_req_slot(STREAM_C)];
     slot.req->set_addr(this->next_addr(STREAM_C));
     slot.req->set_size(this->bandwidth);
     slot.req->set_is_write(false);
-    ++this->preload_reserved;
 }
 
 void MXCore::enqueue_write_request(bool z, bool sz) {
@@ -1055,7 +1078,6 @@ void MXCore::enqueue_write_request(bool z, bool sz) {
     slot.req->set_addr(this->next_addr(i));
     slot.req->set_size(size);
     slot.req->set_is_write(true);
-    this->output_requests.push_back(slot_id);
     // Rotate only when a competing request loses an accepted FIFO push.
     if (z && sz) {
         this->result_rr_counter = !this->result_rr_counter;
@@ -1068,9 +1090,9 @@ void MXCore::handle_response(unsigned slot_id, int64_t response_cycle) {
         this->trace.fatal("MXCore TCDM request failed\n");
     }
     slot.state = REQ_RETURNED;
-    // The HCI response buffer adds one cycle. A read still owns the slot until
-    // process_responses() transfers its data into the input FIFO.
-    slot.available_at = response_cycle + 1;
+    // Physical r_valid time. process_responses() clocks the independent HCI
+    // response FIFO before the data can reach the downstream input FIFO.
+    slot.available_at = response_cycle;
     this->trace_responses();
     this->check_state();
 }
@@ -1090,6 +1112,7 @@ void MXCore::tcdm_response(vp::Block *__this, vp::IoReq *req) {
 void MXCore::tcdm_grant(vp::Block *__this, vp::IoReq *req) {
     MXCore *_this = static_cast<MXCore *>(__this);
     if (_this->denied_req_slot >= 0 && _this->req_slots[_this->denied_req_slot].req == req) {
+        _this->accept_request(unsigned(_this->denied_req_slot));
         if (_this->req_slots[_this->denied_req_slot].epoch == _this->epoch) {
             trace_pulse(_this->wave_gnt);
             uint32_t zero = 0;
@@ -1109,22 +1132,17 @@ int MXCore::arbitrate_request() {
         return -1;
     }
 
-    for (unsigned stream : {STREAM_C, STREAM_A, STREAM_B, STREAM_SA, STREAM_SB}) {
-        for (auto index : this->pending[stream]) {
-            
-            const ReqSlot &slot = this->req_slots[index];
-            if (slot.state != REQ_QUEUED || slot.available_at > now) {
-                continue;
-            }
-
-            return index;
+    for (unsigned stream : {STREAM_C, STREAM_A, STREAM_B, STREAM_SA, STREAM_SB, STREAM_Z}) {
+        const unsigned channel = hci_channel(stream);
+        const auto &fifo = this->hci_fifos[channel];
+        if (fifo.requests.empty()) {
+            continue;
         }
-    }
-
-    if (!this->output_requests.empty()) {
-        const unsigned index = this->output_requests.front();
+        const unsigned index = fifo.requests.front();
         const ReqSlot &slot = this->req_slots[index];
-        if (slot.state == REQ_QUEUED && slot.available_at <= now) {
+        if (slot.state == REQ_QUEUED && slot.available_at <= now &&
+            fifo.can_issue(this->response_arrival(channel) >= 0,
+                           this->response_consumer_ready(channel))) {
             return index;
         }
     }
@@ -1134,11 +1152,9 @@ int MXCore::arbitrate_request() {
 void MXCore::issue_request(unsigned slot_id) {
     const auto now = this->clock.get_cycles();
     ReqSlot   &slot = this->req_slots[slot_id];
-    if (slot.stream == STREAM_Z || slot.stream == STREAM_SZ) {
-        if (this->output_requests.empty() || this->output_requests.front() != slot_id) {
-            throw std::logic_error("MXCore result request FIFO order mismatch");
-        }
-        this->output_requests.pop_front();
+    const auto &requests = this->hci_fifos[hci_channel(slot.stream)].requests;
+    if (requests.empty() || requests.front() != slot_id) {
+        throw std::logic_error("MXCore HCI issue order mismatch");
     }
     slot.state = REQ_PENDING;
     slot.issued_at = now;
@@ -1152,6 +1168,7 @@ void MXCore::issue_request(unsigned slot_id) {
     this->next_bus_cycle = now + std::max(uint64_t(1), slot.req->get_duration());
     if (response == vp::IO_REQ_OK || response == vp::IO_REQ_PENDING) {
         // Both statuses accept the request immediately; DENIED waits for grant().
+        this->accept_request(slot_id);
         trace_pulse(this->wave_gnt);
         uint32_t zero = 0;
         this->wave_req.dump_next(reinterpret_cast<uint8_t *>(&zero), 1);
@@ -1165,44 +1182,43 @@ void MXCore::issue_request(unsigned slot_id) {
     }
 }
 
+void MXCore::accept_request(unsigned slot_id) {
+    const ReqSlot &slot = this->req_slots[slot_id];
+    if (slot.epoch == this->epoch) {
+        this->hci_fifos[hci_channel(slot.stream)].pop_request(slot_id, this->clock.get_cycles());
+    }
+}
+
 void MXCore::process_responses() {
     const auto now = this->clock.get_cycles();
     for (unsigned i = 0; i < this->req_slots.size(); ++i) {
         const ReqSlot &slot = this->req_slots[i];
-        if (slot.epoch != this->epoch && slot.state == REQ_RETURNED && slot.available_at <= now) {
+        if (slot.state == REQ_RETURNED &&
+            ((slot.epoch != this->epoch && slot.available_at <= now) ||
+             (slot.req->get_is_write() && slot.available_at + 1 <= now))) {
             this->free_req_slot(i);
         }
     }
 
-    for (unsigned stream = 0; stream < NB_STREAMS; ++stream) {
-        auto &q = this->pending[stream];
-        if (q.empty()) {
+    for (unsigned channel = 0; channel < NB_TCDM_CHANNELS; ++channel) {
+        const int arrival = this->response_arrival(channel);
+        const int popped = this->hci_fifos[channel].clock_response(
+            arrival, this->response_consumer_ready(channel));
+        if (arrival >= 0) {
+            this->req_slots[arrival].state = REQ_BUFFERED;
+        }
+        if (popped < 0) {
             continue;
         }
-
-        const unsigned slot_id = q.front();
-        ReqSlot       &slot = this->req_slots[slot_id];
-        if (slot.state != REQ_RETURNED || slot.available_at > now) {
-            continue;
-        }
-
+        ReqSlot &slot = this->req_slots[popped];
+        const unsigned stream = slot.stream;
         if (stream < NB_INPUT_STREAMS) {
-            if (!this->input_push_ready[stream]) {
-                continue;
-            }
-
             this->process_iter_instruction(slot.buf, stream);
         } else if (stream == STREAM_C) {
-            if (!this->preload_push_ready) {
-                continue;
-            }
-
             this->preload_buffer.emplace_back(slot.buf, slot.buf + this->bandwidth);
-            --this->preload_reserved;
         }
 
-        this->free_req_slot(slot_id);
-        q.pop_front();
+        this->free_req_slot(unsigned(popped));
     }
 }
 
@@ -1232,8 +1248,8 @@ void MXCore::trace_compute_state() {
 void MXCore::trace_responses() {
     const auto now = this->clock.get_cycles();
     for (auto &slot : this->req_slots) {
-        if (slot.epoch == this->epoch && slot.state == REQ_RETURNED &&
-            !slot.response_traced && slot.available_at - 1 <= now) {
+        if (slot.epoch == this->epoch && slot.state == REQ_RETURNED && !slot.req->get_is_write() &&
+            !slot.response_traced && slot.available_at <= now) {
             // Observe the bus response, before the extra HCI buffer cycle.
             trace_pulse(this->wave_rsp);
             slot.response_traced = true;
@@ -1284,12 +1300,10 @@ unsigned MXCore::process_iter_instruction(uint8_t *buf, unsigned instr) {
     case STREAM_SA:
     case STREAM_SB: {
         auto     &fifo = this->get_input_buffer(instr);
-        auto     &reserved = this->input_reserved[instr];
         unsigned &lane = this->input_push_lane[instr];
-        if (!this->input_can_push(instr) || !reserved[lane]) {
-            throw std::logic_error("input FIFO overflow/unreserved beat");
+        if (!this->input_can_push(instr)) {
+            throw std::logic_error("input FIFO overflow");
         }
-        --reserved[lane];
         fifo[lane].emplace_back(buf, buf + this->bandwidth);
         lane = (lane + 1) % fifo.size();
         return this->bandwidth;
@@ -1438,7 +1452,7 @@ void MXCore::process_compute() {
     
     bool all_valid = true;
     for (unsigned i = 0; i < NB_INPUT_STREAMS; ++i) {
-        all_valid &= !this->fence[i].empty() || this->input_valid(i);
+        all_valid &= this->input_valid(i);
     }
     
     bool                  retire_valid = false;
@@ -1459,43 +1473,33 @@ void MXCore::process_compute() {
     std::vector<uint32_t> computed_bits;
     uint8_t               computed_status = 0;
     
-    if (engine_ready) {
-        // i_input_fence
+    if (engine_ready && all_valid) {
+        // RTL vector_a/scale_a/vector_b/scale_b advance together on in_fire.
         std::array<Bytes, NB_INPUT_STREAMS> operands;
         for (unsigned i = 0; i < NB_INPUT_STREAMS; ++i) {
-            if (!this->fence[i].empty()) {
-                operands[i] = this->fence[i];
-            } else if (this->input_valid(i)) {
-                operands[i] = this->input_peek(i);
-                this->input_pop(i);
-            }
-            if (!all_valid && !operands[i].empty()) {
-                this->fence[i] = operands[i];
-            }
+            operands[i] = this->input_peek(i);
+            this->input_pop(i);
         }
-        if (all_valid) {
-            compute_valid = true;
-            computed_bits.resize(this->npe);
-            const uint32_t *d = first && !this->preload ? nullptr : partial.data();
+        compute_valid = true;
+        computed_bits.resize(this->npe);
+        const uint32_t *d = first && !this->preload ? nullptr : partial.data();
 
-            if (this->src_fmt == InputFormat::E2M1) {
-                computed_status = matmul_fp4(computed_bits.data(), d, operands[0].data(),
+        if (this->src_fmt == InputFormat::E2M1) {
+            computed_status = matmul_fp4(computed_bits.data(), d, operands[0].data(),
+                                         operands[1].data(), operands[2].data(), operands[3].data(),
+                                         this->vs, this->npe, this->dotp);
+        } else if (this->src_fmt == InputFormat::E4M3) {
+            computed_status = matmul_fp8e4m3(computed_bits.data(), d, operands[0].data(),
                                              operands[1].data(), operands[2].data(), operands[3].data(),
-                                             this->vs, this->npe, this->dotp);
-            } else if (this->src_fmt == InputFormat::E4M3) {
-                computed_status = matmul_fp8e4m3(computed_bits.data(), d, operands[0].data(),
-                                                 operands[1].data(), operands[2].data(), operands[3].data(),
-                                                 1, this->vs, this->vs, this->npe, this->reuse, this->dotp);
-            } else {
-                computed_status = matmul_fp8e5m2(computed_bits.data(), d, operands[0].data(),
-                                                 operands[1].data(), operands[2].data(), operands[3].data(),
-                                                 1, this->vs, this->vs, this->npe, this->reuse, this->dotp);
-            }
-            if (!first || this->preload) {
-                this->partial_sum_valid[feedback_row] = false;
-                this->partial_read_row = (this->partial_read_row + 1) % this->reuse;
-            }
-            this->fence = {};
+                                             1, this->vs, this->vs, this->npe, this->reuse, this->dotp);
+        } else {
+            computed_status = matmul_fp8e5m2(computed_bits.data(), d, operands[0].data(),
+                                             operands[1].data(), operands[2].data(), operands[3].data(),
+                                             1, this->vs, this->vs, this->npe, this->reuse, this->dotp);
+        }
+        if (!first || this->preload) {
+            this->partial_sum_valid[feedback_row] = false;
+            this->partial_read_row = (this->partial_read_row + 1) % this->reuse;
         }
     }
     
@@ -1581,7 +1585,9 @@ bool MXCore::finished() const {
            std::none_of(this->partial_sum_valid.begin(), this->partial_sum_valid.end(),
                         [](bool v) { return v; }) &&
            this->result_buffer.empty() && this->result_scale_buffer.empty() &&
-           this->preload_buffer.empty() && !this->preload_reserved && !this->preload_word &&
+           this->preload_buffer.empty() && !this->preload_word &&
+           std::all_of(this->hci_fifos.begin(), this->hci_fifos.end(),
+                       [](const mxcore::HciFifo &fifo) { return fifo.empty(); }) &&
            (!this->standalone ||
             (this->standalone_input_done && !this->standalone_slice &&
              std::all_of(this->standalone_buffer.begin(), this->standalone_buffer.end(),
@@ -1596,6 +1602,13 @@ void MXCore::check_state() {
 
 void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
     MXCore *_this = static_cast<MXCore *>(__this);
+    // Let response callbacks already scheduled at this edge settle before
+    // sampling HCI r_valid/ready. Zero delay preserves this edge's cycle number.
+    _this->event_enqueue(_this->fsm_update_event, 0);
+}
+
+void MXCore::fsm_update(vp::Block *__this, vp::ClockEvent *) {
+    MXCore *_this = static_cast<MXCore *>(__this);
     // Synchronous targets can report a future response via request latency.
     _this->trace_responses();
     
@@ -1608,14 +1621,9 @@ void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
         return;
     }
     
-    std::array<bool, NB_INPUT_STREAMS> room;
-    
     for (unsigned i = 0; i < NB_INPUT_STREAMS; ++i) {
-        room[i] = _this->input_can_reserve(i);
         _this->input_push_ready[i] = _this->input_can_push(i);
     }
-    const bool preload_room = (_this->preload || _this->standalone) &&
-        _this->preload_buffer.size() + _this->preload_reserved < 2 * STREAM_FIFO_DEPTH;
     _this->preload_push_ready = _this->preload_buffer.size() < STREAM_FIFO_DEPTH;
     
     const bool final = _this->final_rows == _this->expected_rows;
@@ -1629,8 +1637,8 @@ void MXCore::fsm_handler(vp::Block *__this, vp::ClockEvent *) {
         _this->process_compute();
     }
     
-    _this->enqueue_read_requests(room);
-    _this->enqueue_preload_request(preload_room);
+    _this->enqueue_read_requests();
+    _this->enqueue_preload_request();
     _this->enqueue_write_request(z, sz);
     const int slot_id = _this->arbitrate_request();
     
@@ -1762,7 +1770,6 @@ bool MXCore::stream_done(unsigned stream) const {
 void MXCore::init_input_buffers() {
     this->input_width = {this->vs, this->npe * this->vs, 1, this->npe};
     this->input_push_lane.fill(0);
-    this->input_reserve_lane.fill(0);
     this->input_slice.fill(0);
     this->input_row.fill(0);
     this->input_scale_repeat.fill(0);
@@ -1771,7 +1778,6 @@ void MXCore::init_input_buffers() {
     for (unsigned stream = 0; stream < NB_INPUT_STREAMS; ++stream) {
         const unsigned lanes = std::max(1u, this->input_width[stream] / this->bandwidth);
         this->get_input_buffer(stream).assign(lanes, {});
-        this->input_reserved[stream].assign(lanes, 0);
     }
     
     this->scale_b_short =
@@ -1806,32 +1812,6 @@ const FifoLanes &MXCore::get_input_buffer(unsigned stream) const {
         default:
             throw std::logic_error("invalid MXCore input stream");
     }
-}
-
-bool MXCore::input_can_reserve(unsigned stream) const {
-    const auto     &fifo = this->get_input_buffer(stream);
-    const auto     &reserved = this->input_reserved[stream];
-    const unsigned &reserve_lane = this->input_reserve_lane[stream];
-
-    if (fifo[reserve_lane].size() + reserved[reserve_lane] < STREAM_FIFO_DEPTH) {
-        return true;
-    }
-    
-    unsigned incoming = 0;
-    for (unsigned i = 0; i < fifo.size(); ++i) {
-        incoming += std::max(0, int(fifo[i].size() + reserved[i]) - int(STREAM_FIFO_DEPTH));
-    }
-    
-    return incoming < STREAM_FIFO_DEPTH;
-}
-
-void MXCore::input_reserve(unsigned stream) {
-    auto     &fifo = this->get_input_buffer(stream);
-    auto     &reserved = this->input_reserved[stream];
-    unsigned &reserve_lane = this->input_reserve_lane[stream];
-
-    ++reserved[reserve_lane];
-    reserve_lane = (reserve_lane + 1) % fifo.size();
 }
 
 bool MXCore::input_can_push(unsigned stream) const {

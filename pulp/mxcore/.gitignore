@@ -4,3 +4,15 @@ tb/input
 tb/golden
 output_tb
 build
+
+# Local simulation waveforms and logs.
+*.vcd
+*.fst
+*.wlf
+*.log
+transcript
+modelsim.ini
+
+# Local RTL waveform setup; not required by the GVSoC model or testbench.
+/tb/rtl_timing.do
+/tb/rtl_timing_vcd.tcl
