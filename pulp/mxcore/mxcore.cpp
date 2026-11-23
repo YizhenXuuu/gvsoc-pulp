@@ -103,6 +103,7 @@ class MXCore : public vp::Component {
     int32_t acquire();
     void    commit(bool start);
     void    start_next_job();
+    void    launch_job();
     void    soft_clear(uint32_t value);
     void    clear_engine();
     void    clear_events();
@@ -197,6 +198,10 @@ class MXCore : public vp::Component {
     uint64_t               num_matmul = 0;
 
     // HWPE job control
+    enum class StartupPhase { NONE, COMMITTED, ADDRESS_FIFO };
+    StartupPhase startup_phase = StartupPhase::NONE;
+    int64_t startup_edge = 0;
+    bool finish_pending = false; // Output event precedes the registered idle state.
     uint8_t  job_id_counter = 0;
     int      job_state = 0;      // 0: free to acquire; -2: acquired, not committed.
     uint8_t  running_job_id = 0; // RTL RUNNING counts retired jobs, modulo 256.
@@ -466,6 +471,9 @@ void MXCore::reset(bool active) {
 
 void MXCore::clear_engine() {
     ++this->epoch;
+    this->startup_phase = StartupPhase::NONE;
+    this->startup_edge = 0;
+    this->finish_pending = false;
     this->reg_fsm_state.set(IDLE);
     this->reg_busy.set(0);
 
@@ -636,7 +644,7 @@ int32_t MXCore::acquire() {
     if (this->job_state == -2) {
         return -2; 
     }
-    if (this->reg_busy.get()) {
+    if (this->reg_busy.get() || this->startup_phase != StartupPhase::NONE) {
         return -1;
     }
     this->job_state = -2;
@@ -646,7 +654,7 @@ int32_t MXCore::acquire() {
 void MXCore::commit(bool start) {
     this->job_state = 0;
 
-    if (start && !this->reg_busy.get()) {
+    if (start && !this->reg_busy.get() && this->startup_phase == StartupPhase::NONE) {
         this->start_next_job();
     }
     if (start) {
@@ -798,20 +806,27 @@ void MXCore::start_next_job() {
     this->dotp_result_valid.assign(this->pipe_regs, false);
     std::fill(this->dotp_result_status.begin(), this->dotp_result_status.end(), 0);
     this->trace_compute_state();
-    this->timer_start = this->time.get_time();
-    this->cycle_start = this->clock.get_cycles();
     this->result_rr_counter = false;
     for (auto &fifo : this->hci_fifos) {
         fifo.clear();
     }
+    // TRIGGER clocks counter_pending first. MXCoreIdle consumes that pending
+    // context at the next edge; busy must not rise inside the MMIO callback.
+    this->startup_phase = StartupPhase::COMMITTED;
+    this->startup_edge = this->clock.get_cycles() + 1;
+    this->check_state();
+}
+
+void MXCore::launch_job() {
     this->reg_fsm_state.set(PRELOAD);
     this->reg_busy.set(1);
+    this->timer_start = this->time.get_time();
+    this->cycle_start = this->clock.get_cycles();
     this->trace.msg(vp::TraceLevel::DEBUG,
                     "MXCore start: M=%u K=%u N=%u VS=%u NPE=%u Reuse=%u BW=%uB/cycle "
                     "pipe=%u standalone=%u C=%u-bit\n", this->m_size,
                     this->k_size, this->n_size, this->vs, this->npe, this->reuse, this->bandwidth,
-                    this->pipe_regs, unsigned(this->standalone), c_bits);
-    this->check_state();
+                    this->pipe_regs, unsigned(this->standalone), this->standalone_input_bf16 ? 16u : 32u);
 }
 
 void MXCore::finish_job() {
@@ -825,9 +840,9 @@ void MXCore::finish_job() {
         ++this->finished_count;
     }
 
-    this->reg_fsm_state.set(IDLE);
-    this->reg_busy.set(0);
-    this->context_status = 0;
+    // RTL job_done/evt[1] is combinational in Output. state_q returns to idle
+    // at the following edge, so busy remains asserted for this event cycle.
+    this->finish_pending = true;
     this->trace.msg(vp::TraceLevel::INFO,
                     "MXCore finished: %lld cycles, %lld ns, %llu bundles, status=0x%02x, "
                     "total=%lld ns, GEMM=%llu\n",
@@ -1614,6 +1629,31 @@ void MXCore::fsm_update(vp::Block *__this, vp::ClockEvent *) {
     
     if (_this->event_pending || _this->sw_evt) {
         _this->clear_events();
+    }
+
+    if (_this->finish_pending) {
+        _this->finish_pending = false;
+        _this->reg_fsm_state.set(IDLE);
+        _this->reg_busy.set(0);
+        _this->context_status = 0;
+        return;
+    }
+
+    if (_this->startup_phase != StartupPhase::NONE) {
+        const auto now = _this->clock.get_cycles();
+        if (now >= _this->startup_edge) {
+            if (_this->startup_phase == StartupPhase::COMMITTED) {
+                _this->launch_job();
+                _this->startup_phase = StartupPhase::ADDRESS_FIFO;
+                _this->startup_edge = now + 1;
+            } else {
+                // addr_valid_q was generated at launch; the address FIFO
+                // captures it at this edge. Its old head is usable next edge.
+                _this->startup_phase = StartupPhase::NONE;
+            }
+        }
+        _this->check_state();
+        return;
     }
     
     if (_this->reg_fsm_state.get() == IDLE) {

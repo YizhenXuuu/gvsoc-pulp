@@ -576,7 +576,9 @@ private:
                           << " preload=" << self.preload << " standalone=" << self.standalone
                           << " no_stalls=" << self.no_stalls << '\n';
                 self.phase = Phase::SOFT_CLEAR;
-                self.timer.enqueue(1);
+                // After wait(rst_n), PERIPH_WRITE waits for its setup edge,
+                // then the slave samples req at the following rising edge.
+                self.timer.enqueue(2);
                 break;
             case Phase::SOFT_CLEAR:
                 self.peripheral(0x14, true, 0);
