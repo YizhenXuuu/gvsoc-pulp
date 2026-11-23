@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // MXCore HWPE. Register input, clocked FSM and completion follow LightRedmule's
 // component structure; register semantics and the data path follow MXCore RTL.
+#include "b_buffer.hpp"
 #include "hci_fifo.hpp"
 #include "mxdotp.hpp"
 #include "quantizer.hpp"
@@ -293,6 +294,7 @@ class MXCore : public vp::Component {
     std::array<unsigned, NB_INPUT_STREAMS>              input_scale_repeat{};
     std::array<unsigned, NB_INPUT_STREAMS>              input_block{};
     std::array<bool, NB_INPUT_STREAMS> input_push_ready{}; // FIFO readiness sampled before the edge.
+    std::array<bool, NB_INPUT_STREAMS> input_pop_pending{}; // B/SB read and write clock together.
     bool                               scale_b_short = false;
 
     // Output stream metadata; array order is result data, result scales.
@@ -303,9 +305,9 @@ class MXCore : public vp::Component {
 
     // MXCore buffers
     FifoLanes                           a_buffer;
-    FifoLanes                           b_buffer;
+    mxcore::BBuffer                     b_buffer;
     FifoLanes                           scale_a_buffer;
-    FifoLanes                           scale_b_buffer;
+    mxcore::BBuffer                     scale_b_buffer;
     
     // one NPE-wide result, exception status and valid bit per stage.
     std::vector<std::vector<uint32_t>> dotp_result_buffer;
@@ -499,6 +501,7 @@ void MXCore::clear_engine() {
     this->b_buffer.clear();
     this->scale_a_buffer.clear();
     this->scale_b_buffer.clear();
+    this->input_pop_pending.fill(false);
     this->partial_sum_buffer.clear();
     this->partial_sum_valid.clear();
     this->partial_sum_final.clear();
@@ -1216,6 +1219,18 @@ void MXCore::process_responses() {
     }
 
     for (unsigned channel = 0; channel < NB_TCDM_CHANNELS; ++channel) {
+        if (channel == STREAM_B || channel == STREAM_SB) {
+            const auto &responses = this->hci_fifos[channel].responses;
+            const uint8_t *beat = responses.empty() ? nullptr : this->req_slots[responses.front()].buf;
+            auto &buffer = channel == STREAM_B ? this->b_buffer : this->scale_b_buffer;
+            // A slice can be stored even while upstream ready is low. Keep the
+            // HCI head until the last slice; newly arriving data cannot bypass.
+            const bool consumed = buffer.clock(beat, this->input_pop_pending[channel]);
+            if (consumed != (beat && this->response_consumer_ready(channel))) {
+                throw std::logic_error("MXCore B buffer/HCI handshake mismatch");
+            }
+            this->input_pop_pending[channel] = false;
+        }
         const int arrival = this->response_arrival(channel);
         const int popped = this->hci_fifos[channel].clock_response(
             arrival, this->response_consumer_ready(channel));
@@ -1227,7 +1242,7 @@ void MXCore::process_responses() {
         }
         ReqSlot &slot = this->req_slots[popped];
         const unsigned stream = slot.stream;
-        if (stream < NB_INPUT_STREAMS) {
+        if (stream == STREAM_A || stream == STREAM_SA) {
             this->process_iter_instruction(slot.buf, stream);
         } else if (stream == STREAM_C) {
             this->preload_buffer.emplace_back(slot.buf, slot.buf + this->bandwidth);
@@ -1311,9 +1326,7 @@ void MXCore::process_iter_instruction() {
 unsigned MXCore::process_iter_instruction(uint8_t *buf, unsigned instr) {
     switch (instr) {
     case STREAM_A:
-    case STREAM_B:
-    case STREAM_SA:
-    case STREAM_SB: {
+    case STREAM_SA: {
         auto     &fifo = this->get_input_buffer(instr);
         unsigned &lane = this->input_push_lane[instr];
         if (!this->input_can_push(instr)) {
@@ -1814,26 +1827,26 @@ void MXCore::init_input_buffers() {
     this->input_row.fill(0);
     this->input_scale_repeat.fill(0);
     this->input_block.fill(0);
+    this->input_pop_pending.fill(false);
     
-    for (unsigned stream = 0; stream < NB_INPUT_STREAMS; ++stream) {
+    for (unsigned stream : {STREAM_A, STREAM_SA}) {
         const unsigned lanes = std::max(1u, this->input_width[stream] / this->bandwidth);
         this->get_input_buffer(stream).assign(lanes, {});
     }
     
     this->scale_b_short =
         uint64_t(this->npe) * this->inner_blocks * this->b_col_tiles < this->bandwidth;
+    this->b_buffer.configure(this->bandwidth, this->input_width[STREAM_B], this->reuse, 1);
+    this->scale_b_buffer.configure(this->bandwidth, this->input_width[STREAM_SB], this->reuse,
+                                   this->input_block_size / this->elements_per_dotp, this->scale_b_short);
 }
 
 FifoLanes &MXCore::get_input_buffer(unsigned stream) {
     switch (stream) {
         case STREAM_A:
             return this->a_buffer;
-        case STREAM_B:
-            return this->b_buffer;
         case STREAM_SA:
             return this->scale_a_buffer;
-        case STREAM_SB:
-            return this->scale_b_buffer;
         default:
             throw std::logic_error("invalid MXCore input stream");
     }
@@ -1843,18 +1856,18 @@ const FifoLanes &MXCore::get_input_buffer(unsigned stream) const {
     switch (stream) {
         case STREAM_A:
             return this->a_buffer;
-        case STREAM_B:
-            return this->b_buffer;
         case STREAM_SA:
             return this->scale_a_buffer;
-        case STREAM_SB:
-            return this->scale_b_buffer;
         default:
             throw std::logic_error("invalid MXCore input stream");
     }
 }
 
 bool MXCore::input_can_push(unsigned stream) const {
+    if (stream == STREAM_B || stream == STREAM_SB) {
+        const auto &buffer = stream == STREAM_B ? this->b_buffer : this->scale_b_buffer;
+        return buffer.input_ready(!this->hci_fifos[stream].responses.empty());
+    }
     const auto     &fifo = this->get_input_buffer(stream);
     const unsigned &push_lane = this->input_push_lane[stream];
 
@@ -1862,12 +1875,18 @@ bool MXCore::input_can_push(unsigned stream) const {
 }
 
 bool MXCore::input_valid(unsigned stream) const {
+    if (stream == STREAM_B || stream == STREAM_SB) {
+        return (stream == STREAM_B ? this->b_buffer : this->scale_b_buffer).valid();
+    }
     const auto &fifo = this->get_input_buffer(stream);
 
     return std::all_of(fifo.begin(), fifo.end(), [](const auto &q) { return !q.empty(); });
 }
 
 Bytes MXCore::input_peek(unsigned stream) const {
+    if (stream == STREAM_B || stream == STREAM_SB) {
+        return (stream == STREAM_B ? this->b_buffer : this->scale_b_buffer).peek();
+    }
     const unsigned  beat = this->bandwidth;
     const unsigned  output = this->input_width[stream];
     const unsigned  reuse = this->reuse;
@@ -1896,11 +1915,16 @@ Bytes MXCore::input_peek(unsigned stream) const {
 }
 
 void MXCore::input_pop(unsigned stream) {
+    if (stream == STREAM_B || stream == STREAM_SB) {
+        // Defer the release so response loading cannot reuse this row at the
+        // same edge. Compute and HCI see the same pre-edge row_full state.
+        this->input_pop_pending[stream] = true;
+        return;
+    }
     const unsigned beat = this->bandwidth;
     const unsigned output = this->input_width[stream];
     const unsigned reuse = this->reuse;
     const unsigned factor = this->input_block_size / this->elements_per_dotp;
-    const bool     short_b = this->scale_b_short;
     auto          &fifo = this->get_input_buffer(stream);
     unsigned      &slice = this->input_slice[stream];
     unsigned      &row = this->input_row[stream];
@@ -1928,19 +1952,7 @@ void MXCore::input_pop(unsigned stream) {
         return;
     }
     
-    const unsigned repetitions = stream == STREAM_A ? 1 : reuse;
-    if (++row != repetitions) {
-        return;
-    }
-    
-    row = 0;
-    const unsigned scales = stream == STREAM_SB ? factor : 1;
-    if (++scale_repeat != scales) {
-        return;
-    }
-    
-    scale_repeat = 0;
-    if (output < beat && !(stream == STREAM_SB && short_b)) {
+    if (output < beat) {
         if (++slice != beat / output) {
             return;
         }
