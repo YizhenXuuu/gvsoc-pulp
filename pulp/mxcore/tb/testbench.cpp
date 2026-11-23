@@ -573,8 +573,11 @@ private:
                 std::cout << "[TB] CONFIG M=" << self.M << " K=" << self.K << " N=" << self.N
                           << " VS=" << self.VS << " NPE=" << self.NPE << " REUSE=" << self.Reuse
                           << " input=" << self.input_format << " output=" << self.output_format
-                          << " preload=" << self.preload << " standalone=" << self.standalone
-                          << " no_stalls=" << self.no_stalls << '\n';
+                          << " preload=" << self.preload << " standalone=" << self.standalone;
+                if (self.standalone) {
+                    std::cout << " standalone_input=" << (self.standalone_input_bits == 16 ? "bf16" : "fp32");
+                }
+                std::cout << " no_stalls=" << self.no_stalls << '\n';
                 self.phase = Phase::SOFT_CLEAR;
                 // After wait(rst_n), PERIPH_WRITE waits for its setup edge,
                 // then the slave samples req at the following rising edge.
